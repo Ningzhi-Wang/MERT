@@ -43,6 +43,7 @@ import os
 import math
 
 from nnAudio import features as nnAudioFeatures
+from .utils import discretized_mix_logistic_loss
 
 logger = logging.getLogger(__name__)
 
@@ -462,6 +463,12 @@ class MERTConfig(FairseqDataclass):
         metadata={"help": "whether to do layernorm on waveform before fed to CNN"},
     )
 
+    logistic_cqt: bool = field(
+        default=False,
+        metadata={"help": "whether logistic distribution as CQT loss"},
+    )
+
+
 
 class model_mel_pred(torch.nn.Module):
     def __init__(self, input_dim, n_bins=84, sr=16000, freq=50):
@@ -517,7 +524,7 @@ class model_mel_pred(torch.nn.Module):
         return self.forward_dict[forward_type](x)
 
 class model_cqt_pred(torch.nn.Module):
-    def __init__(self, input_dim, n_bins=84, sr=16000, freq=50):
+    def __init__(self, input_dim, n_bins=84, sr=16000, freq=50, logistic=False):
         super().__init__()
         self.epsilon=1e-10
         # Getting Mel Spectrogram on the fly
@@ -542,12 +549,16 @@ class model_cqt_pred(torch.nn.Module):
         # self.fc2 = nn.Linear(1024, n_bins)
 
         # 1-layer version
+        if logistic:
+            self.fc = nn.Linear(input_dim, n_bins * 30)
+            self.criterion = discretized_mix_logistic_loss
+        else:
+            self.fc = nn.Linear(input_dim, n_bins)
+            self.criterion = nn.MSELoss()
 
-        self.fc = nn.Linear(input_dim, n_bins)
-
-        self.criterion = nn.MSELoss()
         self.forward_dict = {
-            'masked_transformer_output': self.plain_forward
+            'masked_transformer_output': self.plain_forward,
+            'masked_logistic_output': self.logistic_forward,
         }
     def compute_cqt(self, x):
         '''
@@ -572,6 +583,14 @@ class model_cqt_pred(torch.nn.Module):
         x = self.fc2(torch.transpose(x,1,2))
         # print(x.shape)
         return torch.transpose(x,1,2)
+
+    def logistic_forward(self, x):
+        '''
+        take input from transformer hidden states: [batch * len_seq, channel]
+        output: [batch * len_seq, n_bins]
+        '''
+        x = self.fc(x)
+        return x.view(*x.shape[:-1], -1, 30).permute(0, 3, 1, 2)
 
     def plain_forward(self, x):
         '''
@@ -755,7 +774,8 @@ class MERTModel(BaseFairseqModel):
                 input_dim=cfg.encoder_embed_dim,
                 n_bins=cfg.audio_cqt_bins,
                 sr=int(task_cfg.sample_rate),
-                freq=int(cfg.label_rate)
+                freq=int(cfg.label_rate),
+                logistic=cfg.logistic_cqt
                 )
         if cfg.audio_mel_loss_m:
             logger.info("train the model with extra task: reconstruct mel from transformer output")
@@ -1144,14 +1164,14 @@ class MERTModel(BaseFairseqModel):
         # x: (B, T, D), float
         # padding_mask: (B, T), bool
         # mask_indices: (B, T), bool
-        x, _ = self.encoder(
+        x, layer_results = self.encoder(
             x,
             padding_mask=padding_mask,
             layer=None if output_layer is None else output_layer - 1,
         )
 
         if features_only:
-            return {"x": x, "padding_mask": padding_mask, "features": features}
+            return {"x": x, "padding_mask": padding_mask, "features": features, "layer_results": layer_results}
 
         def compute_pred(proj_x, target, label_embs, logit_temp=None):
             # skip the codebook that is not selected
@@ -1263,7 +1283,8 @@ class MERTModel(BaseFairseqModel):
                     cqt_targets = self.encoder_cqt_model.compute_cqt(source)
                 cqt_targets = cqt_targets[:masked_indices.shape[0],:masked_indices.shape[1]] # dump the last
 
-            cqt_pred_m = self.encoder_cqt_model(x[masked_indices])
+            cqt_forward_type = "masked_logistic_output" if self.cfg.logistic_cqt else "masked_transformer_output"
+            cqt_pred_m = self.encoder_cqt_model(x[masked_indices], forward_type=cqt_forward_type)
             # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape) 
             cqt_loss_m = self.encoder_cqt_model.criterion(cqt_pred_m, cqt_targets[masked_indices])
             result["cqt_pred_m"] = cqt_loss_m
@@ -1297,8 +1318,10 @@ class MERTModel(BaseFairseqModel):
         padding_mask: Optional[torch.Tensor] = None,
         mask: bool = False,
         ret_conv: bool = False,
+        ret_layer: bool = True,
         output_layer: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        source = source.squeeze(1) if source.dim() > 2 else source
         res = self.forward(
             source,
             padding_mask=padding_mask,
@@ -1306,8 +1329,12 @@ class MERTModel(BaseFairseqModel):
             features_only=True,
             output_layer=output_layer,
         )
-        feature = res["features"] if ret_conv else res["x"]
-        return feature, res["padding_mask"]
+        if ret_conv:
+            return res["features"]
+        elif ret_layer:
+            features = res["layer_results"]
+            return torch.stack([feature[0].permute(1, 0, 2) for feature in features], dim=1)
+        return res['x']
 
     def get_logits(self, net_output, is_masked=True):
         if is_masked:
@@ -1384,7 +1411,7 @@ class MERTModel(BaseFairseqModel):
 
 
 class TransformerEncoder_extend(TransformerEncoder):
-    def build_encoder_layer(self, args: MERTConfig):
+    def build_encoder_layer(self, args: MERTConfig, **kwargs):
 
         if args.layer_type == "transformer":
 
