@@ -579,6 +579,7 @@ class model_cqt_pred(torch.nn.Module):
                 p,
                 self.target_scaler(d.unsqueeze(1)),
             )
+            self.n_bins = n_bins
         else:
             self.fc = nn.Linear(input_dim, n_bins)
             self.criterion = nn.MSELoss()
@@ -618,7 +619,7 @@ class model_cqt_pred(torch.nn.Module):
         output: [batch * len_seq, n_bins]
         """
         x = self.fc(x)
-        return x.view(x.shape[0], 30, -1)
+        return x.view(-1, 30, self.n_bins)
 
     def plain_forward(self, x):
         """
