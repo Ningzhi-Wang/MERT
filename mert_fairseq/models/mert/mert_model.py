@@ -572,7 +572,12 @@ class model_cqt_pred(torch.nn.Module):
 
         # 1-layer version
         if logistic:
-            self.fc = nn.Sequential(nn.Linear(input_dim, n_bins * 30), nn.Tanh())
+            self.conv = nn.Sequential(
+                nn.Conv1d(1, 30, 1, 1, 0),
+                nn.ELU(),
+                LayerNorm(n_bins, elementwise_affine=False)
+            )
+            self.fc = nn.Sequential(nn.Linear(input_dim, n_bins), nn.Tanh())
             self.target_scaler = get_scaler(init_min=0, init_max=3)
             self.criterion = discretized_mix_logistic_loss
             self.criterion = lambda p, d: discretized_mix_logistic_loss(
@@ -618,8 +623,10 @@ class model_cqt_pred(torch.nn.Module):
         take input from transformer hidden states: [batch * len_seq, channel]
         output: [batch * len_seq, n_bins]
         """
+        x = x.unsqueeze(1)
+        x = self.conv(x)
         x = self.fc(x)
-        return x.view(-1, 30, self.n_bins)
+        return x
 
     def plain_forward(self, x):
         """
