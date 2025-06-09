@@ -43,12 +43,13 @@ import os
 import math
 
 from nnAudio import features as nnAudioFeatures
-from .utils import discretized_mix_logistic_loss
+from .utils import discretized_mix_logistic_loss, get_scaler
 
 logger = logging.getLogger(__name__)
 
 MASK_REPLACE_TYPE_CHOICES = ChoiceEnum(["in_batch", "in_sample"])
 AUDIO_FEAT_EXTRACTOR_TYPE_CHOICES = ChoiceEnum(["w2v_conv", "hstft_conv"])
+
 
 @dataclass
 class MERTConfig(FairseqDataclass):
@@ -127,13 +128,21 @@ class MERTConfig(FairseqDataclass):
     # cr: yinghao implementation
     audio_extract_type: AUDIO_FEAT_EXTRACTOR_TYPE_CHOICES = field(
         default="w2v_conv",
-        metadata={"help": "the type of audio feature extractor used to extract audio features"},
+        metadata={
+            "help": "the type of audio feature extractor used to extract audio features"
+        },
     )
     music_conv_nmel: int = field(
-        default=80, metadata={'help':'the papra meter for logmel transformation in the input feature extractor'}
+        default=80,
+        metadata={
+            "help": "the papra meter for logmel transformation in the input feature extractor"
+        },
     )
     music_conv_hoplen: int = field(
-        default=40, metadata={'help':'the papra meter for STFT hop length in the input feature extractor, default set to 40 for 16k audio to align with HuBERT'}
+        default=40,
+        metadata={
+            "help": "the papra meter for STFT hop length in the input feature extractor, default set to 40 for 16k audio to align with HuBERT"
+        },
     )
     conv_feature_layers: str = field(
         default="[(512,10,5)] + [(512,3,2)] * 4 + [(512,2,2)] * 2",
@@ -143,7 +152,6 @@ class MERTConfig(FairseqDataclass):
             "[(dim, kernel_size, stride), ...]"
         },
     )
-
 
     conv_bias: bool = field(
         default=False, metadata={"help": "include bias in conv encoder"}
@@ -180,7 +188,7 @@ class MERTConfig(FairseqDataclass):
         metadata={"help": "probability of replacing a token with mask"},
     )
 
-    # dynamic mask prob 
+    # dynamic mask prob
     mask_dynamic_prob_step: str = field(
         default="[]",
         metadata={
@@ -197,7 +205,7 @@ class MERTConfig(FairseqDataclass):
             "eg, [0.1, 0.2, 0.4, 0.6, 0.8]"
         },
     )
-    
+
     # dynamic mask length
     mask_dynamic_len_step: str = field(
         default="[]",
@@ -237,7 +245,9 @@ class MERTConfig(FairseqDataclass):
     # replacement in mask
     mask_replace: float = field(
         default=0.0,
-        metadata={"help": "probability of replacing the mask embeddings with other embeddings"},
+        metadata={
+            "help": "probability of replacing the mask embeddings with other embeddings"
+        },
     )
     mask_replace_type: MASK_REPLACE_TYPE_CHOICES = field(
         default="in_sample",
@@ -245,7 +255,9 @@ class MERTConfig(FairseqDataclass):
     )
     mask_origin: float = field(
         default=0.0,
-        metadata={"help": "probability of keeping the original embeddings at the mask position"},
+        metadata={
+            "help": "probability of keeping the original embeddings at the mask position"
+        },
     )
     # channel masking
     mask_channel_length: int = field(
@@ -332,7 +344,7 @@ class MERTConfig(FairseqDataclass):
     )
     fp16: bool = field(default=False, metadata={"help": "If fp16 is being used"})
 
-    # cqt loss 
+    # cqt loss
     audio_cqt_loss_m: bool = field(
         default=False,
         metadata={"help": "whether to predict the CQT of the audio of masked pard"},
@@ -341,7 +353,7 @@ class MERTConfig(FairseqDataclass):
         default=84,
         metadata={"help": "the bins of CQT feature"},
     )
-    # mel loss 
+    # mel loss
     audio_mel_loss_m: bool = field(
         default=False,
         metadata={"help": "whether to predict the CQT of the audio of masked pard"},
@@ -358,7 +370,9 @@ class MERTConfig(FairseqDataclass):
     )
     feature_extractor_cqt_bins: int = field(
         default=84,
-        metadata={"help": "the number of bins of CQT feature as extra input of transformer"},
+        metadata={
+            "help": "the number of bins of CQT feature as extra input of transformer"
+        },
     )
 
     mixture_prob: float = field(
@@ -367,7 +381,7 @@ class MERTConfig(FairseqDataclass):
     )
 
     inbatch_noise_augment_len_range: Optional[str] = field(
-        default = "[8000, 24000]",
+        default="[8000, 24000]",
         metadata={
             "help": (
                 "the range of length of the mix-up noise augmentation, unit in smaples"
@@ -376,15 +390,11 @@ class MERTConfig(FairseqDataclass):
     )
 
     inbatch_noise_augment_number_range: Optional[str] = field(
-        default = "[1, 3]",
-        metadata={
-            "help": (
-                "the range of numbers of the mix-up noise augmentation"
-            )
-        },
+        default="[1, 3]",
+        metadata={"help": ("the range of numbers of the mix-up noise augmentation")},
     )
     inbatch_noise_augment_volume: float = field(
-        default = 1.0,
+        default=1.0,
         metadata={
             "help": (
                 "the coefficient used to modify the volume of the noise audios wavs"
@@ -397,39 +407,31 @@ class MERTConfig(FairseqDataclass):
         metadata={"help": "whether to learn nce temperature duing training"},
     )
     learnable_temp_init: float = field(
-        default = 0.1,
-        metadata={
-            "help": (
-                "initial value for the learnable tempatures"
-            )
-        },
+        default=0.1,
+        metadata={"help": ("initial value for the learnable tempatures")},
     )
     learnable_temp_max: float = field(
-        default = 100.0,
-        metadata={
-            "help": (
-                "maximum scale value of the exp(learnable tempatures)"
-            )
-        },
+        default=100.0,
+        metadata={"help": ("maximum scale value of the exp(learnable tempatures)")},
     )
 
     chunk_nce_cal: int = field(
-        default = -1,
-        metadata={
-            "help": (
-                "maximum scale value of the exp(learnable tempatures)"
-            )
-        },
+        default=-1,
+        metadata={"help": ("maximum scale value of the exp(learnable tempatures)")},
     )
 
     pretrained_weights: str = field(
         default="",
-        metadata={"help": "a path of model checkpoint to initialize the weights of the model"},
+        metadata={
+            "help": "a path of model checkpoint to initialize the weights of the model"
+        },
     )
 
     random_codebook: int = field(
         default=-1,
-        metadata={"help": "whether to randomly select n of the codebooks during training"},
+        metadata={
+            "help": "whether to randomly select n of the codebooks during training"
+        },
     )
 
     deepnorm: bool = field(
@@ -442,7 +444,6 @@ class MERTConfig(FairseqDataclass):
         metadata={"help": "whether to use deepnorm from SubLN"},
     )
 
-
     emb_grad_mult: float = field(
         default=1.0,
         metadata={"help": "multiply word embedding var grads by this"},
@@ -450,12 +451,16 @@ class MERTConfig(FairseqDataclass):
 
     attention_relax: float = field(
         default=-1.0,
-        metadata={"help": "whether to use additional relaxing scale for attention module"},
+        metadata={
+            "help": "whether to use additional relaxing scale for attention module"
+        },
     )
 
     do_cnn_feat_stable_layernorm: bool = field(
         default=False,
-        metadata={"help": "whether to modify and add additional non-affine layer_norm after feature and proj(feature)"},
+        metadata={
+            "help": "whether to modify and add additional non-affine layer_norm after feature and proj(feature)"
+        },
     )
 
     wav_normalize: bool = field(
@@ -469,32 +474,38 @@ class MERTConfig(FairseqDataclass):
     )
 
 
-
 class model_mel_pred(torch.nn.Module):
     def __init__(self, input_dim, n_bins=84, sr=16000, freq=50):
         super().__init__()
         # self.epsilon=1e-10
         # Getting Mel Spectrogram on the fly
-        self.spec_layer = transforms.MelSpectrogram(sample_rate=sr, n_fft=2048, hop_length=sr//freq, f_min=32.7,  # win_length=None
-                                        f_max=None, n_mels=n_bins, window_fn=torch.hann_window, center=True,  # normalized=False,
-                                        pad_mode='constant',  # pad=0,
-                                        mel_scale='htk', normalized=True)  # norm=None, nrom on slaney mel_scale  power: float = 2.0,
-        
+        self.spec_layer = transforms.MelSpectrogram(
+            sample_rate=sr,
+            n_fft=2048,
+            hop_length=sr // freq,
+            f_min=32.7,  # win_length=None
+            f_max=None,
+            n_mels=n_bins,
+            window_fn=torch.hann_window,
+            center=True,  # normalized=False,
+            pad_mode="constant",  # pad=0,
+            mel_scale="htk",
+            normalized=True,
+        )  # norm=None, nrom on slaney mel_scale  power: float = 2.0,
+
         self.fc = nn.Linear(input_dim, n_bins)
 
         self.criterion = nn.MSELoss()
-        self.forward_dict = {
-            'masked_transformer_output': self.plain_forward
-        }
+        self.forward_dict = {"masked_transformer_output": self.plain_forward}
 
     def compute_mel(self, x):
-        '''
+        """
         convert waveform to CQT -> [batch, bins, len] -> transpose
-        '''
-        # align with the padding of HuBERT model, 
+        """
+        # align with the padding of HuBERT model,
         # the truncation is calculated by bruteforce search since the nnAudio padding strategy and fairseq models are different
-        # x = x[..., :-560] 
-        mels = torch.transpose(self.spec_layer(x), -1, -2) + 1e-5 # [batch, len, bins]
+        # x = x[..., :-560]
+        mels = torch.transpose(self.spec_layer(x), -1, -2) + 1e-5  # [batch, len, bins]
         # compute log mel
         logmel = torch.log(mels)
         # return logmel
@@ -503,10 +514,10 @@ class model_mel_pred(torch.nn.Module):
         return S
 
     def plain_forward(self, x):
-        '''
+        """
         take input from transformer hidden states: [batch * len_seq, channel]
         output: [batch * len_seq, n_bins]
-        '''
+        """
         # x = self.fc1(x)
         # x = self.bn(self.relu(x))
         # x = self.fc2(x)
@@ -515,25 +526,36 @@ class model_mel_pred(torch.nn.Module):
 
         return x
 
-    def forward(self, x, forward_type='masked_transformer_output'):
-        '''
+    def forward(self, x, forward_type="masked_transformer_output"):
+        """
         take input from transformer hidden states: [batch, len_seq, channel]
         output: [batch, len_seq, n_bins]
-        '''
-    
+        """
+
         return self.forward_dict[forward_type](x)
+
 
 class model_cqt_pred(torch.nn.Module):
     def __init__(self, input_dim, n_bins=84, sr=16000, freq=50, logistic=False):
         super().__init__()
-        self.epsilon=1e-10
+        self.epsilon = 1e-10
         # Getting Mel Spectrogram on the fly
-        self.spec_layer = nnAudioFeatures.cqt.CQT(sr=sr, hop_length=sr//freq, fmin=32.7, 
-                                           fmax=None, n_bins=n_bins, bins_per_octave=n_bins//7, 
-                                           filter_scale=1, norm=1, window='hann', center=True, 
-                                           pad_mode='constant', trainable=False, 
-                                           output_format='Magnitude', verbose=True)
-
+        self.spec_layer = nnAudioFeatures.cqt.CQT(
+            sr=sr,
+            hop_length=sr // freq,
+            fmin=32.7,
+            fmax=None,
+            n_bins=n_bins,
+            bins_per_octave=n_bins // 7,
+            filter_scale=1,
+            norm=1,
+            window="hann",
+            center=True,
+            pad_mode="constant",
+            trainable=False,
+            output_format="Magnitude",
+            verbose=True,
+        )
 
         # Initializing a Hubert facebook/hubert-base-ls960 style configuration
         # configuration = HubertConfig()
@@ -550,23 +572,29 @@ class model_cqt_pred(torch.nn.Module):
 
         # 1-layer version
         if logistic:
-            self.fc = nn.Linear(input_dim, n_bins * 30)
+            self.fc = nn.Sequential(nn.Linear(input_dim, n_bins * 30), nn.Tanh())
+            self.target_scaler = get_scaler(init_min=0, init_max=3)
             self.criterion = discretized_mix_logistic_loss
+            self.criterion = lambda p, d: discretized_mix_logistic_loss(
+                p,
+                self.target_scaler(d.unsqueeze(1)),
+            )
         else:
             self.fc = nn.Linear(input_dim, n_bins)
             self.criterion = nn.MSELoss()
 
         self.forward_dict = {
-            'masked_transformer_output': self.plain_forward,
-            'masked_logistic_output': self.logistic_forward,
+            "masked_transformer_output": self.plain_forward,
+            "masked_logistic_output": self.logistic_forward,
         }
+
     def compute_cqt(self, x):
-        '''
+        """
         convert waveform to CQT -> [batch, bins, len] -> transpose
-        '''
-        # align with the padding of HuBERT model, 
+        """
+        # align with the padding of HuBERT model,
         # the truncation is calculated by bruteforce search since the nnAudio padding strategy and fairseq models are different
-        # x = x[..., :-560] 
+        # x = x[..., :-560]
         return torch.transpose(self.spec_layer(x), -1, -2)
 
     def keep_dim_forward(self, x):
@@ -576,27 +604,27 @@ class model_cqt_pred(torch.nn.Module):
         # z = self.hubert(x)
         # x = self.encoder(x)
         # print(x.shape)
-        x = self.fc1(torch.transpose(x,1,2))
+        x = self.fc1(torch.transpose(x, 1, 2))
         # print(x.shape)
-        x = self.bn(self.relu(torch.transpose(x,1,2)))
+        x = self.bn(self.relu(torch.transpose(x, 1, 2)))
         # print(x.shape)
-        x = self.fc2(torch.transpose(x,1,2))
+        x = self.fc2(torch.transpose(x, 1, 2))
         # print(x.shape)
-        return torch.transpose(x,1,2)
+        return torch.transpose(x, 1, 2)
 
     def logistic_forward(self, x):
-        '''
+        """
         take input from transformer hidden states: [batch * len_seq, channel]
         output: [batch * len_seq, n_bins]
-        '''
+        """
         x = self.fc(x)
-        return x.view(*x.shape[:-1], -1, 30).permute(0, 3, 1, 2)
+        return x.view(x.shape[0], 30, -1)
 
     def plain_forward(self, x):
-        '''
+        """
         take input from transformer hidden states: [batch * len_seq, channel]
         output: [batch * len_seq, n_bins]
-        '''
+        """
         # x = self.fc1(x)
         # x = self.bn(self.relu(x))
         # x = self.fc2(x)
@@ -605,12 +633,12 @@ class model_cqt_pred(torch.nn.Module):
 
         return x
 
-    def forward(self, x, forward_type='masked_transformer_output'):
-        '''
+    def forward(self, x, forward_type="masked_transformer_output"):
+        """
         take input from transformer hidden states: [batch, len_seq, channel]
         output: [batch, len_seq, n_bins]
-        '''
-    
+        """
+
         return self.forward_dict[forward_type](x)
 
 
@@ -628,15 +656,26 @@ class MERTModel(BaseFairseqModel):
         feature_enc_layers = eval(cfg.conv_feature_layers)  # noqa
         # ? why not just save the whole cfg?? maybe it's because the datatype inside the cfg cant'be changed? since there's eval()
         self.cfg = cfg
-        
-        if self.cfg.feature_extractor_cqt:
-            self.feature_extractor_cqt = nnAudioFeatures.cqt.CQT(sr=task_cfg.sample_rate, hop_length=task_cfg.sample_rate//50, fmin=32.7, 
-                    fmax=None, n_bins=cfg.feature_extractor_cqt_bins, bins_per_octave=cfg.feature_extractor_cqt_bins//7, 
-                    filter_scale=1, norm=1, window='hann', center=True, 
-                    pad_mode='constant', trainable=False, 
-                    output_format='Magnitude', verbose=True)
 
-        if cfg.audio_extract_type == 'w2v_conv':
+        if self.cfg.feature_extractor_cqt:
+            self.feature_extractor_cqt = nnAudioFeatures.cqt.CQT(
+                sr=task_cfg.sample_rate,
+                hop_length=task_cfg.sample_rate // 50,
+                fmin=32.7,
+                fmax=None,
+                n_bins=cfg.feature_extractor_cqt_bins,
+                bins_per_octave=cfg.feature_extractor_cqt_bins // 7,
+                filter_scale=1,
+                norm=1,
+                window="hann",
+                center=True,
+                pad_mode="constant",
+                trainable=False,
+                output_format="Magnitude",
+                verbose=True,
+            )
+
+        if cfg.audio_extract_type == "w2v_conv":
             self.feature_extractor = ConvFeatureExtractionModel(
                 conv_layers=feature_enc_layers,
                 dropout=0.0,
@@ -659,10 +698,11 @@ class MERTModel(BaseFairseqModel):
             else None
         )
         if self.post_extract_proj is not None and self.do_cnn_feat_stable_layernorm:
-            self.post_proj_layer_norm = LayerNorm(cfg.encoder_embed_dim, elementwise_affine=False)
+            self.post_proj_layer_norm = LayerNorm(
+                cfg.encoder_embed_dim, elementwise_affine=False
+            )
         else:
             self.post_proj_layer_norm = None
-
 
         self.mask_prob = cfg.mask_prob
         self.mask_selection = cfg.mask_selection
@@ -689,18 +729,17 @@ class MERTModel(BaseFairseqModel):
 
         self.skip_masked = cfg.skip_masked
         self.skip_nomask = cfg.skip_nomask
-        
+
         self.learnable_temp = cfg.learnable_temp
 
-
         self.wav_normalize = cfg.wav_normalize
-        
+
         if not self.learnable_temp:
             self.logit_temp = cfg.logit_temp
         else:
             self.logit_temp_list = nn.Parameter(torch.FloatTensor(len(dictionaries)))
-            nn.init.constant_(self.logit_temp_list, np.log(1/cfg.learnable_temp_init))
-            # self.logit_temp_list = [ 
+            nn.init.constant_(self.logit_temp_list, np.log(1 / cfg.learnable_temp_init))
+            # self.logit_temp_list = [
             #     nn.Parameter(torch.tensor([np.log(1/cfg.learnable_temp_init)])) for _ in range(len(dictionaries))
             # ]
 
@@ -714,11 +753,7 @@ class MERTModel(BaseFairseqModel):
             torch.FloatTensor(cfg.encoder_embed_dim).uniform_()
         )
 
-        if (
-                cfg.attention_relax > 0 or \
-                cfg.deepnorm or \
-                cfg.subln
-            ):
+        if cfg.attention_relax > 0 or cfg.deepnorm or cfg.subln:
             if cfg.subln:
                 assert cfg.layer_norm_first
             if cfg.deepnorm:
@@ -742,9 +777,9 @@ class MERTModel(BaseFairseqModel):
 
         self.untie_final_proj = cfg.untie_final_proj
         self.random_codebook = cfg.random_codebook
-        
+
         # use all codebook
-        if self.random_codebook <=0:
+        if self.random_codebook <= 0:
             if self.untie_final_proj:
                 self.final_proj = nn.Linear(
                     cfg.encoder_embed_dim, final_dim * len(dictionaries)
@@ -754,7 +789,12 @@ class MERTModel(BaseFairseqModel):
         else:
             assert self.random_codebook <= len(dictionaries)
             if self.untie_final_proj:
-                self.final_projs = nn.ModuleList([nn.Linear(cfg.encoder_embed_dim, final_dim) for _ in range(len(dictionaries))])
+                self.final_projs = nn.ModuleList(
+                    [
+                        nn.Linear(cfg.encoder_embed_dim, final_dim)
+                        for _ in range(len(dictionaries))
+                    ]
+                )
             else:
                 self.final_proj = nn.Linear(cfg.encoder_embed_dim, final_dim)
 
@@ -769,22 +809,27 @@ class MERTModel(BaseFairseqModel):
             nn.init.uniform_(self.label_embs_concat)
 
         if cfg.audio_cqt_loss_m:
-            logger.info("train the model with extra task: reconstruct cqt from transformer output")
+            logger.info(
+                "train the model with extra task: reconstruct cqt from transformer output"
+            )
             self.encoder_cqt_model = model_cqt_pred(
                 input_dim=cfg.encoder_embed_dim,
                 n_bins=cfg.audio_cqt_bins,
                 sr=int(task_cfg.sample_rate),
                 freq=int(cfg.label_rate),
-                logistic=cfg.logistic_cqt
-                )
+                logistic=cfg.logistic_cqt,
+            )
         if cfg.audio_mel_loss_m:
-            logger.info("train the model with extra task: reconstruct mel from transformer output")
+            logger.info(
+                "train the model with extra task: reconstruct mel from transformer output"
+            )
             self.encoder_mel_model = model_mel_pred(
                 input_dim=cfg.encoder_embed_dim,
                 n_bins=cfg.audio_mel_bins,
                 sr=int(task_cfg.sample_rate),
-                freq=int(cfg.label_rate))
-        
+                freq=int(cfg.label_rate),
+            )
+
         self.num_updates = 0
 
         self.mask_dynamic_prob_step = eval(cfg.mask_dynamic_prob_step)
@@ -794,7 +839,7 @@ class MERTModel(BaseFairseqModel):
             self.initialize_dynamic_mask_prob()
         else:
             self.mask_dynamic_prob_stage = -1
-    
+
         self.mask_dynamic_len_step = eval(cfg.mask_dynamic_len_step)
         self.mask_dynamic_len = eval(cfg.mask_dynamic_len)
         if len(self.mask_dynamic_len_step) > 0 and len(self.mask_dynamic_len) > 0:
@@ -804,13 +849,15 @@ class MERTModel(BaseFairseqModel):
 
         self.mixture_prob = cfg.mixture_prob
         self.inbatch_noise_augment_len_range = eval(cfg.inbatch_noise_augment_len_range)
-        self.inbatch_noise_augment_number_range = eval(cfg.inbatch_noise_augment_number_range)
+        self.inbatch_noise_augment_number_range = eval(
+            cfg.inbatch_noise_augment_number_range
+        )
         self.inbatch_noise_augment_volume = cfg.inbatch_noise_augment_volume
 
         if os.path.isfile(cfg.pretrained_weights):
-            load_patterns = ['feature_extractor.'] # ['feature_extractor.', 'encoder.']
+            load_patterns = ["feature_extractor."]  # ['feature_extractor.', 'encoder.']
             logger.info(f"initialize {load_patterns} weights with given checkpoint")
-            pretrained_dict = torch.load(cfg.pretrained_weights)['model']
+            pretrained_dict = torch.load(cfg.pretrained_weights)["model"]
 
             def filter_keys(patterns, keys):
                 toloads = []
@@ -819,54 +866,86 @@ class MERTModel(BaseFairseqModel):
                         if pattern in k:
                             toloads.append(k)
                 return toloads
+
             modules_to_load = filter_keys(load_patterns, pretrained_dict.keys())
             logger.info(f"found modules to load: {modules_to_load}")
-            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in modules_to_load}
-            logger.info(f"extractor sample weitghts before loading:\n{self.feature_extractor.conv_layers[0][2].weight}")
+            pretrained_dict = {
+                k: v for k, v in pretrained_dict.items() if k in modules_to_load
+            }
+            logger.info(
+                f"extractor sample weitghts before loading:\n{self.feature_extractor.conv_layers[0][2].weight}"
+            )
             self.load_state_dict(pretrained_dict, strict=False)
-            logger.info(f"extractor sample weitghts after loading:\n{self.feature_extractor.conv_layers[0][2].weight}")
-            
+            logger.info(
+                f"extractor sample weitghts after loading:\n{self.feature_extractor.conv_layers[0][2].weight}"
+            )
+
             if cfg.feature_grad_mult <= 0:
                 self.feature_extractor.eval()
             # for param in self.feature_extractor.parameters():
             #     param.requires_grad = False
 
-
-    def inbatch_noise_augment(self, 
-        target_audio: torch.Tensor, target_audio_idx: int , 
-        batch_audios: torch.Tensor, # [bsz, audio_lengths]
-        noise_len_min: int, noise_len_max: int, 
-        n_noise_min: int, n_noise_max: int,
-        noise_vol: float = 1.0):
-        '''
+    def inbatch_noise_augment(
+        self,
+        target_audio: torch.Tensor,
+        target_audio_idx: int,
+        batch_audios: torch.Tensor,  # [bsz, audio_lengths]
+        noise_len_min: int,
+        noise_len_max: int,
+        n_noise_min: int,
+        n_noise_max: int,
+        noise_vol: float = 1.0,
+    ):
+        """
         augmenation that leverages in-batch noise audios.
         noise_len_min and noise_len_max are the range of the lengths of noises (counted as samples)
         n_noise_min and n_noise_max are the range of number of noises,
-        '''    
+        """
         # assert noise_len_max <= target_audio.shape[0] and noise_len_min >= 1 # should assert this outside?
 
         augmented_audio = torch.clone(target_audio)
 
         # exclude the target audio and use the rest as noise candidates
-        noise_pool = torch.flatten(torch.cat((batch_audios[:target_audio_idx,:], batch_audios[target_audio_idx+1:,:]), dim=0))
+        noise_pool = torch.flatten(
+            torch.cat(
+                (
+                    batch_audios[:target_audio_idx, :],
+                    batch_audios[target_audio_idx + 1 :, :],
+                ),
+                dim=0,
+            )
+        )
 
         # n_noise = np.random.randint(n_noise_min, n_noise_max+1)
-        n_noise = torch.randint(n_noise_min, n_noise_max+1, size=(1,))
+        n_noise = torch.randint(n_noise_min, n_noise_max + 1, size=(1,))
 
         # random_start_idxs = np.random.randint(0, noise_pool.shape[0] - noise_len_max + 1, size=(n_noise,))
         # random_durations = np.random.randint(noise_len_min, noise_len_max+1, size=(n_noise,))
-        random_start_idxs = torch.randint(0, noise_pool.shape[0] - noise_len_max + 1, size=(n_noise,))
-        random_durations = torch.randint(noise_len_min, noise_len_max+1, size=(n_noise,))
-
+        random_start_idxs = torch.randint(
+            0, noise_pool.shape[0] - noise_len_max + 1, size=(n_noise,)
+        )
+        random_durations = torch.randint(
+            noise_len_min, noise_len_max + 1, size=(n_noise,)
+        )
 
         for noise_idx in range(n_noise):
             # augmentation_position = np.random.randint(0, target_audio.shape[0] - random_durations[noise_idx]+1, size=None)
-            augmentation_position = torch.randint(0, target_audio.shape[0] - random_durations[noise_idx]+1, size=(1,))
-            
+            augmentation_position = torch.randint(
+                0, target_audio.shape[0] - random_durations[noise_idx] + 1, size=(1,)
+            )
+
             # assign noise to the original audio
-            augmented_audio[augmentation_position:augmentation_position+random_durations[noise_idx]] += \
-                noise_vol * noise_pool[random_start_idxs[noise_idx]: random_start_idxs[noise_idx]+random_durations[noise_idx]]
-                
+            augmented_audio[
+                augmentation_position : augmentation_position
+                + random_durations[noise_idx]
+            ] += (
+                noise_vol
+                * noise_pool[
+                    random_start_idxs[noise_idx] : random_start_idxs[noise_idx]
+                    + random_durations[noise_idx]
+                ]
+            )
+
         return augmented_audio
 
     def upgrade_state_dict_named(self, state_dict, name):
@@ -883,34 +962,46 @@ class MERTModel(BaseFairseqModel):
         return model
 
     def compute_replace_mask(self, padding_mask, mask_indices):
-        '''
+        """
         all variables are numpy array
-        '''
-        original_prob = np.random.rand(*mask_indices.shape)<=self.mask_origin
+        """
+        original_prob = np.random.rand(*mask_indices.shape) <= self.mask_origin
         original_indices = np.all([mask_indices, original_prob], axis=0)
-        replace_prob = np.random.rand(*mask_indices.shape)<=self.mask_replace
+        replace_prob = np.random.rand(*mask_indices.shape) <= self.mask_replace
         replace_indices = np.all([mask_indices, replace_prob], axis=0)
-        mask_emb_indices = np.all([mask_indices, ~original_indices, ~replace_indices], axis=0)
+        mask_emb_indices = np.all(
+            [mask_indices, ~original_indices, ~replace_indices], axis=0
+        )
 
-        replace_target_indices = np.zeros(mask_indices.shape,dtype=bool)
-        all_indices = np.ones(mask_indices.shape,dtype=bool)
-        all_indices = np.all([~padding_mask, all_indices], axis=0) # exclude the padding part
-        if self.mask_replace_type == 'in_batch':
+        replace_target_indices = np.zeros(mask_indices.shape, dtype=bool)
+        all_indices = np.ones(mask_indices.shape, dtype=bool)
+        all_indices = np.all(
+            [~padding_mask, all_indices], axis=0
+        )  # exclude the padding part
+        if self.mask_replace_type == "in_batch":
             # replaces with anyone within the batch, no duplicated
             n_replace = np.sum(replace_indices)
-            all_indices = np.where(all_indices) # turn into tuple indices
+            all_indices = np.where(all_indices)  # turn into tuple indices
 
-            replace_target = np.random.choice(len(all_indices[0]), n_replace, replace=False)
-            replace_target_indices[(all_indices[0][replace_target], all_indices[1][replace_target])] = True
+            replace_target = np.random.choice(
+                len(all_indices[0]), n_replace, replace=False
+            )
+            replace_target_indices[
+                (all_indices[0][replace_target], all_indices[1][replace_target])
+            ] = True
 
-        elif self.mask_replace_type == 'in_sample':
+        elif self.mask_replace_type == "in_sample":
             # replaces with anyone within the same sample, no duplicated
             for i in range(mask_indices.shape[0]):
                 # find replacement for each sample
                 n_replace_insample = np.sum(replace_indices[i])
-                all_indices_insample = np.where(all_indices[i]) # (T - padding,)
-                replace_target_insample = np.random.choice(len(all_indices_insample[0]), n_replace_insample, replace=False)
-                replace_target_indices[i][all_indices_insample[0][replace_target_insample]] = True
+                all_indices_insample = np.where(all_indices[i])  # (T - padding,)
+                replace_target_insample = np.random.choice(
+                    len(all_indices_insample[0]), n_replace_insample, replace=False
+                )
+                replace_target_indices[i][
+                    all_indices_insample[0][replace_target_insample]
+                ] = True
 
         return mask_emb_indices, replace_indices, replace_target_indices
 
@@ -929,13 +1020,23 @@ class MERTModel(BaseFairseqModel):
                 min_space=self.mask_min_space,
             )
             if self.mask_replace > 0:
-                mask_emb_indices, replace_indices, replace_target_indices = self.compute_replace_mask(padding_mask, mask_indices)
+                mask_emb_indices, replace_indices, replace_target_indices = (
+                    self.compute_replace_mask(padding_mask, mask_indices)
+                )
 
-                mask_indices = torch.from_numpy(mask_indices).to(x.device) # tokens involved in mask prediction task
-                mask_emb_indices = torch.from_numpy(mask_emb_indices).to(x.device) # tokens replaced with [MASK]
+                mask_indices = torch.from_numpy(mask_indices).to(
+                    x.device
+                )  # tokens involved in mask prediction task
+                mask_emb_indices = torch.from_numpy(mask_emb_indices).to(
+                    x.device
+                )  # tokens replaced with [MASK]
                 # origin_indices = torch.from_numpy(origin_indices).to(x.device) # tokens remains the same, no need to do assignment
-                replace_indices = torch.from_numpy(replace_indices).to(x.device) # tokens that are replaced with other tokens
-                replace_target_indices = torch.from_numpy(replace_target_indices).to(x.device) # tokens that are used to replace
+                replace_indices = torch.from_numpy(replace_indices).to(
+                    x.device
+                )  # tokens that are replaced with other tokens
+                replace_target_indices = torch.from_numpy(replace_target_indices).to(
+                    x.device
+                )  # tokens that are used to replace
 
                 x[mask_emb_indices] = self.mask_emb
                 x[replace_indices] = x[replace_target_indices]
@@ -943,11 +1044,9 @@ class MERTModel(BaseFairseqModel):
             else:
                 mask_indices = torch.from_numpy(mask_indices).to(x.device)
                 x[mask_indices] = self.mask_emb
-        
-                
+
         else:
             mask_indices = None
-
 
         if self.mask_channel_prob > 0:
             mask_channel_indices = compute_mask_indices(
@@ -983,10 +1082,14 @@ class MERTModel(BaseFairseqModel):
                 a = x[start:end]
                 b = targets[start:end]
                 # assert a.shape[0] == b.shape[0], f'mismatch shape of a {a.shape} and b {b.shape}, x {x.shape} and targets {targets.shape}'
-                logits.append(torch.cosine_similarity(a.float(), b.float(), dim=-1).type_as(a))
-            logits = torch.cat(logits,dim=0)
+                logits.append(
+                    torch.cosine_similarity(a.float(), b.float(), dim=-1).type_as(a)
+                )
+            logits = torch.cat(logits, dim=0)
         else:
-            logits = torch.cosine_similarity(x.float(), targets.float(), dim=-1).type_as(x)
+            logits = torch.cosine_similarity(
+                x.float(), targets.float(), dim=-1
+            ).type_as(x)
         logits /= self.logit_temp
         if neg_is_pos.any():
             logits[1:][neg_is_pos] = float("-inf")
@@ -994,7 +1097,7 @@ class MERTModel(BaseFairseqModel):
         return logits
 
     def compute_nce_learned_temp(self, x, pos, negs, logit_temp):
-        
+
         neg_is_pos = (pos == negs).all(-1)
         pos = pos.unsqueeze(0)
         targets = torch.cat([pos, negs], dim=0)
@@ -1003,10 +1106,18 @@ class MERTModel(BaseFairseqModel):
         if self.chunk_nce_cal > 0:
             logits = []
             for start in range(0, x.shape[0], self.chunk_nce_cal):
-                logits.append(torch.cosine_similarity(x[start:start+self.chunk_nce_cal].float(), targets[start:start+self.chunk_nce_cal].float(), dim=-1).type_as(x))
-            logits = torch.cat(logits,dim=0)
+                logits.append(
+                    torch.cosine_similarity(
+                        x[start : start + self.chunk_nce_cal].float(),
+                        targets[start : start + self.chunk_nce_cal].float(),
+                        dim=-1,
+                    ).type_as(x)
+                )
+            logits = torch.cat(logits, dim=0)
         else:
-            logits = torch.cosine_similarity(x.float(), targets.float(), dim=-1).type_as(x)
+            logits = torch.cosine_similarity(
+                x.float(), targets.float(), dim=-1
+            ).type_as(x)
 
         logit_scale = torch.clamp(logit_temp.exp(), max=self.learnable_temp_max)
         logits *= logit_scale
@@ -1014,12 +1125,11 @@ class MERTModel(BaseFairseqModel):
             logits[1:][neg_is_pos] = float("-inf")
         logits = logits.transpose(0, 1)  # (num_x, num_cls+1)
         return logits
-        
 
     def forward_features(self, source: torch.Tensor) -> torch.Tensor:
-        '''
+        """
         features: BxCxT
-        '''
+        """
         if self.wav_normalize:
             assert source.dim() == 2
             with torch.no_grad():
@@ -1063,25 +1173,42 @@ class MERTModel(BaseFairseqModel):
         padding_mask = padding_mask.view(padding_mask.size(0), features.size(1), -1)
         padding_mask = padding_mask.all(-1)
         return padding_mask
-    
+
     def set_num_updates(self, num_updates):
         super().set_num_updates(num_updates)
 
-        if self.mask_dynamic_prob_stage >=0:
-         if num_updates == self.mask_dynamic_prob_step[self.mask_dynamic_prob_stage]:
-            logger.info(f'updating mask_prob from {self.mask_dynamic_prob[self.mask_dynamic_prob_stage]} to {self.mask_dynamic_prob[self.mask_dynamic_prob_stage+1]} at step {num_updates}')
-            self.mask_prob = self.mask_dynamic_prob[self.mask_dynamic_prob_stage+1]
-            # stop updating since it gets to the last stage
-            self.mask_dynamic_prob_stage = self.mask_dynamic_prob_stage + 1 if self.mask_dynamic_prob_stage < len(self.mask_dynamic_prob_step)-1 else -1 
+        if self.mask_dynamic_prob_stage >= 0:
+            if num_updates == self.mask_dynamic_prob_step[self.mask_dynamic_prob_stage]:
+                logger.info(
+                    f"updating mask_prob from {self.mask_dynamic_prob[self.mask_dynamic_prob_stage]} to {self.mask_dynamic_prob[self.mask_dynamic_prob_stage+1]} at step {num_updates}"
+                )
+                self.mask_prob = self.mask_dynamic_prob[
+                    self.mask_dynamic_prob_stage + 1
+                ]
+                # stop updating since it gets to the last stage
+                self.mask_dynamic_prob_stage = (
+                    self.mask_dynamic_prob_stage + 1
+                    if self.mask_dynamic_prob_stage
+                    < len(self.mask_dynamic_prob_step) - 1
+                    else -1
+                )
 
-        if self.mask_dynamic_len_stage >=0:
-         if num_updates == self.mask_dynamic_len_step[self.mask_dynamic_len_stage]:
-            logger.info(f'updating mask_length from {self.mask_dynamic_len[self.mask_dynamic_len_stage]} to {self.mask_dynamic_len[self.mask_dynamic_len_stage+1]} at step {num_updates}')
-            self.mask_length = self.mask_dynamic_len[self.mask_dynamic_len_stage+1]
+        if self.mask_dynamic_len_stage >= 0:
+            if num_updates == self.mask_dynamic_len_step[self.mask_dynamic_len_stage]:
+                logger.info(
+                    f"updating mask_length from {self.mask_dynamic_len[self.mask_dynamic_len_stage]} to {self.mask_dynamic_len[self.mask_dynamic_len_stage+1]} at step {num_updates}"
+                )
+                self.mask_length = self.mask_dynamic_len[
+                    self.mask_dynamic_len_stage + 1
+                ]
 
-            # stop updating since it gets to the last stage
-            self.mask_dynamic_len_stage = self.mask_dynamic_len_stage + 1 if self.mask_dynamic_len_stage < len(self.mask_dynamic_len_step)-1 else -1
-            
+                # stop updating since it gets to the last stage
+                self.mask_dynamic_len_stage = (
+                    self.mask_dynamic_len_stage + 1
+                    if self.mask_dynamic_len_stage < len(self.mask_dynamic_len_step) - 1
+                    else -1
+                )
+
         self.num_updates = num_updates
 
     def forward(
@@ -1110,12 +1237,17 @@ class MERTModel(BaseFairseqModel):
                     if torch.rand(1).item() > self.mixture_prob:
                         try:
                             source[i] = self.inbatch_noise_augment(
-                                                    target_audio = batch_audios[i], target_audio_idx = i, batch_audios = batch_audios,
-                                                    noise_len_min = self.inbatch_noise_augment_len_range[0], noise_len_max = self.inbatch_noise_augment_len_range[1], 
-                                                    n_noise_min = self.inbatch_noise_augment_number_range[0], n_noise_max = self.inbatch_noise_augment_number_range[1],
-                                                    noise_vol = self.inbatch_noise_augment_volume)
+                                target_audio=batch_audios[i],
+                                target_audio_idx=i,
+                                batch_audios=batch_audios,
+                                noise_len_min=self.inbatch_noise_augment_len_range[0],
+                                noise_len_max=self.inbatch_noise_augment_len_range[1],
+                                n_noise_min=self.inbatch_noise_augment_number_range[0],
+                                n_noise_max=self.inbatch_noise_augment_number_range[1],
+                                noise_vol=self.inbatch_noise_augment_volume,
+                            )
                         except:
-                            source[i] = batch_audios[i]                
+                            source[i] = batch_audios[i]
 
         features = self.forward_features(source)
         if target_list is not None:
@@ -1123,11 +1255,11 @@ class MERTModel(BaseFairseqModel):
 
         features_pen = features.float().pow(2).mean()
 
-        features = features.transpose(1, 2) # BxTxC
+        features = features.transpose(1, 2)  # BxTxC
 
         if self.cfg.feature_extractor_cqt:
             features_cqt = self.feature_extractor_cqt(source).transpose(1, 2)
-            features_cqt = features_cqt[:,:features.shape[1],:] # align shape
+            features_cqt = features_cqt[:, : features.shape[1], :]  # align shape
             # version 1
             # features = features + features_cqt
             # features = self.layer_norm(features)
@@ -1135,8 +1267,8 @@ class MERTModel(BaseFairseqModel):
             # features_cqt = self.post_cqt_feature_proj(features_cqt) # v2
             # features = self.layer_norm(features) + self.layer_norm(features_cqt)
             # version 3
-            features = torch.cat([features,features_cqt], 2)
-            features = self.layer_norm(features) # BxTxC
+            features = torch.cat([features, features_cqt], 2)
+            features = self.layer_norm(features)  # BxTxC
         else:
             features = self.layer_norm(features)
         unmasked_features = features.clone()
@@ -1148,7 +1280,6 @@ class MERTModel(BaseFairseqModel):
             features = self.post_extract_proj(features)
             if self.post_proj_layer_norm is not None:
                 features = self.post_proj_layer_norm(features)
-
 
         features = self.dropout_input(features)
         unmasked_features = self.dropout_features(unmasked_features)
@@ -1171,7 +1302,12 @@ class MERTModel(BaseFairseqModel):
         )
 
         if features_only:
-            return {"x": x, "padding_mask": padding_mask, "features": features, "layer_results": layer_results}
+            return {
+                "x": x,
+                "padding_mask": padding_mask,
+                "features": features,
+                "layer_results": layer_results,
+            }
 
         def compute_pred(proj_x, target, label_embs, logit_temp=None):
             # skip the codebook that is not selected
@@ -1195,17 +1331,21 @@ class MERTModel(BaseFairseqModel):
 
         if not self.skip_masked:
             masked_indices = torch.logical_and(~padding_mask, mask_indices)
-            
+
             # @yizhilll: TODO merge the codes heredui
             if self.random_codebook <= 0:
                 proj_x_m = self.final_proj(x[masked_indices])
                 if self.untie_final_proj:
-                    proj_x_m_list = proj_x_m.chunk(len(target_list), dim=-1)             
+                    proj_x_m_list = proj_x_m.chunk(len(target_list), dim=-1)
                 else:
-                    proj_x_m_list = [proj_x_m for _ in range(len(target_list))] # no extra RAM taken here
+                    proj_x_m_list = [
+                        proj_x_m for _ in range(len(target_list))
+                    ]  # no extra RAM taken here
             else:
                 # pass
-                selected_books = np.random.choice(len(target_list),self.random_codebook)
+                selected_books = np.random.choice(
+                    len(target_list), self.random_codebook
+                )
                 proj_x_m_list = []
                 for i in range(len(target_list)):
                     if i in selected_books:
@@ -1215,18 +1355,21 @@ class MERTModel(BaseFairseqModel):
                             proj_x_m_list.append(self.final_proj(x[masked_indices]))
                     else:
                         proj_x_m_list.append(None)
-                
 
             if self.learnable_temp:
                 logit_m_list = [
-                    compute_pred(proj_x_m, t[masked_indices], label_embs_list[i], logit_temp)
-                    for i, (proj_x_m, t, logit_temp),  in enumerate(zip(proj_x_m_list, target_list, self.logit_temp_list))
+                    compute_pred(
+                        proj_x_m, t[masked_indices], label_embs_list[i], logit_temp
+                    )
+                    for i, (proj_x_m, t, logit_temp), in enumerate(
+                        zip(proj_x_m_list, target_list, self.logit_temp_list)
+                    )
                 ]
             else:
                 logit_m_list = [
                     compute_pred(proj_x_m, t[masked_indices], label_embs_list[i])
                     for i, (proj_x_m, t) in enumerate(zip(proj_x_m_list, target_list))
-                ]    
+                ]
             # else:
             #     # # mute to optimize the codes
             #     proj_x_m_list = [proj_x_m for _ in range(len(target_list))]
@@ -1262,8 +1405,8 @@ class MERTModel(BaseFairseqModel):
         # if self.emb_grad_mult > 0 and self.emb_grad_mult !=1.0:
         #     self.label_embs_concat = GradMultiply.apply(self.label_embs_concat, self.emb_grad_mult)
 
-            # word_embeddin =  ∗α+word_embedding .detach()∗(1−α).
-            # self.label_embs_concat = self.label_embs_concat * self.emb_grad_mult + self.label_embs_concat.detach()*(1-self.emb_grad_mult)
+        # word_embeddin =  ∗α+word_embedding .detach()∗(1−α).
+        # self.label_embs_concat = self.label_embs_concat * self.emb_grad_mult + self.label_embs_concat.detach()*(1-self.emb_grad_mult)
 
         result = {
             "logit_m_list": logit_m_list,
@@ -1274,35 +1417,53 @@ class MERTModel(BaseFairseqModel):
 
         if self.cfg.audio_cqt_loss_m:
             if cqt_labels is not None:
-                cqt_targets = cqt_labels[:masked_indices.shape[0],:masked_indices.shape[1]] # dump the last
+                cqt_targets = cqt_labels[
+                    : masked_indices.shape[0], : masked_indices.shape[1]
+                ]  # dump the last
             else:
                 if self.mixture_prob > 0:
                     # no need to compute again
                     assert cqt_targets is not None
                 else:
                     cqt_targets = self.encoder_cqt_model.compute_cqt(source)
-                cqt_targets = cqt_targets[:masked_indices.shape[0],:masked_indices.shape[1]] # dump the last
+                cqt_targets = cqt_targets[
+                    : masked_indices.shape[0], : masked_indices.shape[1]
+                ]  # dump the last
 
-            cqt_forward_type = "masked_logistic_output" if self.cfg.logistic_cqt else "masked_transformer_output"
-            cqt_pred_m = self.encoder_cqt_model(x[masked_indices], forward_type=cqt_forward_type)
-            # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape) 
-            cqt_loss_m = self.encoder_cqt_model.criterion(cqt_pred_m, cqt_targets[masked_indices])
+            cqt_forward_type = (
+                "masked_logistic_output"
+                if self.cfg.logistic_cqt
+                else "masked_transformer_output"
+            )
+            cqt_pred_m = self.encoder_cqt_model(
+                x[masked_indices], forward_type=cqt_forward_type
+            )
+            # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape)
+            cqt_loss_m = self.encoder_cqt_model.criterion(
+                cqt_pred_m, cqt_targets[masked_indices]
+            )
             result["cqt_pred_m"] = cqt_loss_m
 
         if self.cfg.audio_mel_loss_m:
             if mel_labels is not None:
-                mel_targets = mel_labels[:masked_indices.shape[0],:masked_indices.shape[1]] # dump the last
+                mel_targets = mel_labels[
+                    : masked_indices.shape[0], : masked_indices.shape[1]
+                ]  # dump the last
             else:
                 if self.mixture_prob > 0:
                     # no need to compute again
                     assert mel_targets is not None
                 else:
                     mel_targets = self.encoder_mel_model.compute_mel(source)
-                mel_targets = mel_targets[:masked_indices.shape[0],:masked_indices.shape[1]] # dump the last
+                mel_targets = mel_targets[
+                    : masked_indices.shape[0], : masked_indices.shape[1]
+                ]  # dump the last
 
             mel_pred_m = self.encoder_mel_model(x[masked_indices])
-            # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape) 
-            mel_loss_m = self.encoder_mel_model.criterion(mel_pred_m, mel_targets[masked_indices])
+            # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape)
+            mel_loss_m = self.encoder_mel_model.criterion(
+                mel_pred_m, mel_targets[masked_indices]
+            )
             result["mel_pred_m"] = mel_loss_m
 
         if self.learnable_temp:
@@ -1333,8 +1494,10 @@ class MERTModel(BaseFairseqModel):
             return res["features"]
         elif ret_layer:
             features = res["layer_results"]
-            return torch.stack([feature[0].permute(1, 0, 2) for feature in features], dim=1)
-        return res['x']
+            return torch.stack(
+                [feature[0].permute(1, 0, 2) for feature in features], dim=1
+            )
+        return res["x"]
 
     def get_logits(self, net_output, is_masked=True):
         if is_masked:
@@ -1362,7 +1525,7 @@ class MERTModel(BaseFairseqModel):
         if "mel_pred_m" in net_output:
             extra_losses.append(net_output["mel_pred_m"])
             names.append("mel_pred_m")
-            
+
         return extra_losses, names
 
     def remove_pretraining_modules(self):
@@ -1372,38 +1535,50 @@ class MERTModel(BaseFairseqModel):
     def initialize_dynamic_mask_prob(self):
         # if len(self.mask_dynamic_prob_step) > 0 and len(self.mask_dynamic_prob) > 0:
         if self.num_updates == 0:
-            logger.info(f'setting masking prob...')
+            logger.info(f"setting masking prob...")
         else:
-            logger.info(f"loading checkpoint at step {self.num_updates}, resuming the mask_prob is set to trained with dynamic schedule")
-        assert len(self.mask_dynamic_prob_step) + 1 == len(self.mask_dynamic_prob), ("the len(step) is the step of updating mask_prob")
+            logger.info(
+                f"loading checkpoint at step {self.num_updates}, resuming the mask_prob is set to trained with dynamic schedule"
+            )
+        assert len(self.mask_dynamic_prob_step) + 1 == len(
+            self.mask_dynamic_prob
+        ), "the len(step) is the step of updating mask_prob"
         self.mask_dynamic_prob_stage = 0
         for i in self.mask_dynamic_prob_step:
             if self.num_updates >= i:
                 self.mask_dynamic_prob_stage += 1
         self.mask_prob = self.mask_dynamic_prob[self.mask_dynamic_prob_stage]
-        logger.info(f'set the masking prob as {self.mask_prob}, stage {self.mask_dynamic_prob_stage}')
-        if self.num_updates >=  self.mask_dynamic_prob_step[-1]:
-            self.mask_dynamic_prob_stage = -1 # no need for further updating
+        logger.info(
+            f"set the masking prob as {self.mask_prob}, stage {self.mask_dynamic_prob_stage}"
+        )
+        if self.num_updates >= self.mask_dynamic_prob_step[-1]:
+            self.mask_dynamic_prob_stage = -1  # no need for further updating
 
     def initialize_dynamic_mask_len(self):
         if self.num_updates == 0:
-            logger.info(f'setting masking prob...')
+            logger.info(f"setting masking prob...")
         else:
-            logger.info(f"loading checkpoint at step {self.num_updates}, resuming the mask_length is set to trained with dynamic schedule")
-        assert len(self.mask_dynamic_len_step) + 1 == len(self.mask_dynamic_len), ("the len(step) is the step of updating mask_len")
+            logger.info(
+                f"loading checkpoint at step {self.num_updates}, resuming the mask_length is set to trained with dynamic schedule"
+            )
+        assert len(self.mask_dynamic_len_step) + 1 == len(
+            self.mask_dynamic_len
+        ), "the len(step) is the step of updating mask_len"
         self.mask_dynamic_len_stage = 0
         for i in self.mask_dynamic_len_step:
             if self.num_updates >= i:
                 self.mask_dynamic_len_stage += 1
         self.mask_length = self.mask_dynamic_len[self.mask_dynamic_len_stage]
-        logger.info(f'set the masking length as {self.mask_length}, stage {self.mask_dynamic_len_stage}')
-        if self.num_updates >=  self.mask_dynamic_len_step[-1]:
-            self.mask_dynamic_len_stage = -1 # no need for further updating
+        logger.info(
+            f"set the masking length as {self.mask_length}, stage {self.mask_dynamic_len_stage}"
+        )
+        if self.num_updates >= self.mask_dynamic_len_step[-1]:
+            self.mask_dynamic_len_stage = -1  # no need for further updating
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         if len(self.mask_dynamic_prob_step) > 0 and len(self.mask_dynamic_prob) > 0:
             self.initialize_dynamic_mask_prob()
-    
+
         if len(self.mask_dynamic_len_step) > 0 and len(self.mask_dynamic_len) > 0:
             self.initialize_dynamic_mask_len()
 
@@ -1415,7 +1590,7 @@ class TransformerEncoder_extend(TransformerEncoder):
 
         if args.layer_type == "transformer":
 
-            if (args.deepnorm or args.subln or args.attention_relax > 0.0 ):
+            if args.deepnorm or args.subln or args.attention_relax > 0.0:
                 residual_alpha = 1.0
                 if args.deepnorm:
                     residual_alpha = math.pow(2.0 * args.encoder_layers, 0.25)
@@ -1443,7 +1618,6 @@ class TransformerEncoder_extend(TransformerEncoder):
                     activation_fn=args.activation_fn,
                     layer_norm_first=args.layer_norm_first,
                 )
-
 
         elif args.layer_type == "conformer":
             layer = ConformerWav2Vec2EncoderLayer(
@@ -1487,6 +1661,7 @@ class TransformerEncoder_extend(TransformerEncoder):
                 ):
                     p.data.div_(init_scale)
 
+
 class TransformerSentenceEncoderLayerExtend(TransformerSentenceEncoderLayer):
     """
     Extend the Transformer Encoder Layer to support DeepNorm.
@@ -1519,10 +1694,11 @@ class TransformerSentenceEncoderLayerExtend(TransformerSentenceEncoderLayer):
         # Initialize blocks
         self.activation_fn = utils.get_activation_fn(activation_fn)
 
-
         if attention_relax > 0:
             # self.attention_relax = attention_relax
-            logger.info(f"creating custom attention layer with relaxation scale: {attention_relax}")
+            logger.info(
+                f"creating custom attention layer with relaxation scale: {attention_relax}"
+            )
             self.self_attn = MultiheadAttention_extend(
                 self.embedding_dim,
                 num_attention_heads,
@@ -1549,12 +1725,12 @@ class TransformerSentenceEncoderLayerExtend(TransformerSentenceEncoderLayer):
         self.self_attn_layer_norm = LayerNorm(self.embedding_dim)
         self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
         self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
-        
+
         self.ffn_layernorm = LayerNorm(ffn_embedding_dim) if subln else None
-        
+
         # layer norm associated with the position wise feed-forward NN
         self.final_layer_norm = LayerNorm(self.embedding_dim)
-    
+
     def residual_connection(self, x, residual):
         return residual * self.residual_alpha + x
 
@@ -1631,7 +1807,7 @@ class TransformerSentenceEncoderLayerExtend(TransformerSentenceEncoderLayer):
             x = self.final_layer_norm(x)
 
         return x, (attn, layer_result)
-    
+
 
 class MultiheadAttention_extend(MultiheadAttention):
     def __init__(
@@ -1649,7 +1825,7 @@ class MultiheadAttention_extend(MultiheadAttention):
         # dictionary=None,
         q_noise=0.0,
         qn_block_size=8,
-        attention_relax = -1.0,
+        attention_relax=-1.0,
         # TODO: pass in config rather than string.
         # config defined in xformers.components.attention.AttentionConfig
         xformers_att_config: Optional[str] = None,
@@ -1664,9 +1840,9 @@ class MultiheadAttention_extend(MultiheadAttention):
         # super().__init__()
         # initialize the instance with the father class method
         # MultiheadAttention.__init__(self,
-        # super(MultiheadAttention_extend, self).__init__(        
-        # super(self).__init__(  
-        super().__init__(   
+        # super(MultiheadAttention_extend, self).__init__(
+        # super(self).__init__(
+        super().__init__(
             embed_dim,
             num_heads,
             kdim=kdim,
@@ -1681,7 +1857,7 @@ class MultiheadAttention_extend(MultiheadAttention):
             q_noise=q_noise,
             qn_block_size=qn_block_size,
             xformers_att_config=xformers_att_config,
-            xformers_blocksparse_layout=xformers_blocksparse_layout, 
+            xformers_blocksparse_layout=xformers_blocksparse_layout,
             xformers_blocksparse_blocksize=xformers_blocksparse_blocksize,
         )
 
@@ -1693,7 +1869,9 @@ class MultiheadAttention_extend(MultiheadAttention):
         key: Optional[torch.Tensor],
         value: Optional[torch.Tensor],
         key_padding_mask: Optional[torch.Tensor] = None,
-        incremental_state: Optional[Dict[str, Dict[str, Optional[torch.Tensor]]]] = None,
+        incremental_state: Optional[
+            Dict[str, Dict[str, Optional[torch.Tensor]]]
+        ] = None,
         need_weights: bool = True,
         static_kv: bool = False,
         attn_mask: Optional[torch.Tensor] = None,
@@ -1952,21 +2130,22 @@ class MultiheadAttention_extend(MultiheadAttention):
 
         if before_softmax:
             return attn_weights, v
-        if self.attention_relax > 0 :
+        if self.attention_relax > 0:
             # tgt_len == src_len
 
             # => (bsz, self.num_heads, tgt_len, src_len)
             # attn_weights_relax = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)/self.attention_relax
-            
+
             # => (bsz * self.num_heads, tgt_len, src_len)
             attn_weights_relax = attn_weights / self.attention_relax
 
             # # => (bsz, self.num_heads, 1, src_len)
             # attn_max_relax = torch.max(attn_weights_relax, dim=-2, keepdim=False).unsqueeze(2)
-            
 
             # find max according to K_j' => (bsz* self.num_heads, tgt_len, 1)
-            attn_max_relax = torch.max(attn_weights_relax, dim=-1, keepdim=False).unsqueeze(2)
+            attn_max_relax = torch.max(
+                attn_weights_relax, dim=-1, keepdim=False
+            ).unsqueeze(2)
 
             # => (bsz * self.num_heads, tgt_len, src_len)
             attn_weights = (attn_weights_relax - attn_max_relax) * self.attention_relax

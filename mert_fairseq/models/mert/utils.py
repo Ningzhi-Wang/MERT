@@ -1,6 +1,9 @@
-import torch
+import math
 import numpy as np
+import torch
 import torch.nn.functional as F
+
+from torch import nn
 
 
 def discretized_mix_logistic_loss(
@@ -18,14 +21,14 @@ def discretized_mix_logistic_loss(
         Tensor loss
     """
     # [Batch_size, width, height, channel]
-    pred = pred.permute(0, 2, 3, 1)
-    data = data.permute(0, 2, 3, 1)
+    pred = pred.permute(0, 2, 1)
+    data = data.permute(0, 2, 1)
     # Number of logistic distributions
     nr_mix = pred.shape[-1] // 3
     # unpack paramteres: distribution probability, mean, log scale
-    logit_probs = pred[:, :, :, :nr_mix]
-    mean = pred[:, :, :, nr_mix : 2 * nr_mix]
-    log_scales = torch.clamp(pred[:, :, :, 2 * nr_mix : 3 * nr_mix], min=log_scale_min)
+    logit_probs = pred[..., :nr_mix]
+    mean = pred[..., nr_mix : 2 * nr_mix]
+    log_scales = torch.clamp(pred[..., 2 * nr_mix : 3 * nr_mix], min=log_scale_min)
 
     # Repeat data with nr_mix channels
     data = data * torch.ones((1, 1, 1, nr_mix)).type_as(data)
@@ -59,5 +62,37 @@ def discretized_mix_logistic_loss(
     log_probs = cond * log_cdf_plus + (1.0 - cond) * inner_out
     log_probs = log_probs + F.log_softmax(logit_probs, dim=-1)
 
-    losses = -torch.sum(torch.logsumexp(log_probs, dim=-1), [1, 2]) / pred.shape[1:3].numel()
+    losses = -torch.mean(torch.logsumexp(log_probs, dim=-1), dim=1)
     return losses.mean()
+
+
+class Scaler(nn.Module):
+    def __init__(self, init_min: float = math.inf, init_max: float = -math.inf):
+        super().__init__()
+        self.register_buffer("min", torch.tensor(init_min).float())
+        self.register_buffer("max", torch.tensor(init_max).float())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        min_val = self.min.to(x.device)
+        max_val = self.max.to(x.device)
+        return (x - min_val) / max((max_val - min_val), 1e-6) * 2 - 1
+
+    def reverse(self, x: torch.Tensor) -> torch.Tensor:
+        min_val = self.min.to(x.device)
+        max_val = self.max.to(x.device)
+        return (x + 1) / 2 * (max_val - min_val) + min_val
+
+
+def adaptive_update_hook(module: Scaler, input):
+    x = input[0]
+    if module.training:
+        module.min.fill_(torch.min(module.min, x.min()))
+        module.max.fill_(torch.max(module.max, x.max()))
+
+
+def get_scaler(adaptive: bool = True, **kwargs) -> Scaler:
+    scaler = Scaler(**kwargs)
+    if adaptive:
+        scaler.register_forward_pre_hook(adaptive_update_hook)
+    return scaler
+
