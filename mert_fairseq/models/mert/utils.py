@@ -2,6 +2,7 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import distributions as dist
 
 from torch import nn
 
@@ -48,9 +49,9 @@ def discretized_mix_logistic_loss(
     mid_in = inv_stdv * centered_data
     log_pdf_mid = mid_in - log_scales - 2.0 * F.softplus(mid_in)
 
-    inner_inner_cond = (cdf_delta > 1e-5).float()
+    inner_inner_cond = (cdf_delta > 1e-4).float()
     inner_inner_out = inner_inner_cond * torch.log(
-        torch.clamp(cdf_delta, min=1e-12)
+        torch.clamp(cdf_delta, min=1e-4)
     ) + (1.0 - inner_inner_cond) * (
         log_pdf_mid - torch.log(torch.tensor((num_classes - 1) / 2))
     )
@@ -75,7 +76,7 @@ class Scaler(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         min_val = self.min.to(x.device)
         max_val = self.max.to(x.device)
-        return (x - min_val) / max((max_val - min_val), 1e-6) * 2 - 1
+        return (x - min_val) / max((max_val - min_val), 1e-4) * 2 - 1
 
     def reverse(self, x: torch.Tensor) -> torch.Tensor:
         min_val = self.min.to(x.device)
@@ -95,4 +96,24 @@ def get_scaler(adaptive: bool = True, **kwargs) -> Scaler:
     if adaptive:
         scaler.register_forward_pre_hook(adaptive_update_hook)
     return scaler
+
+
+def logistic_dist(a, b):
+    base_distribution = dist.Uniform(0, 1)
+    transforms = [dist.SigmoidTransform().inv, dist.AffineTransform(loc=a, scale=b)]
+    return dist.TransformedDistribution(base_distribution, transforms)
+
+def mix_logistic_loss(x, y):
+    x = x.permute(0, 2, 1)
+    y = y.permute(0, 2, 1).squeeze(-1)
+    nr_mix = x.shape[-1] // 3
+    logit_probs = x[..., :nr_mix]
+    mean = x[..., nr_mix : 2 * nr_mix]
+    scales = F.softplus(x[..., 2 * nr_mix :])
+    log_probs = F.log_softmax(logit_probs, dim=-1)
+    mix = dist.Categorical(logits=log_probs)
+    comp = logistic_dist(mean, scales)
+    mixture_distribution = dist.MixtureSameFamily(mix, comp)
+    loss = -mixture_distribution.log_prob(y)
+    return loss.mean()
 
