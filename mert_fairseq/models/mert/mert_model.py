@@ -43,7 +43,7 @@ import os
 import math
 
 from nnAudio import features as nnAudioFeatures
-from .utils import discretized_mix_logistic_loss, get_scaler
+from .utils import discretized_mix_logistic_loss, get_scaler, mix_logistic_loss
 
 logger = logging.getLogger(__name__)
 
@@ -579,7 +579,6 @@ class model_cqt_pred(torch.nn.Module):
             )
             self.fc = nn.Sequential(nn.Linear(input_dim, n_bins), nn.Tanh())
             self.target_scaler = get_scaler(init_min=-1e-4, init_max=45)
-            self.criterion = discretized_mix_logistic_loss
             self.criterion = lambda p, d: discretized_mix_logistic_loss(
                 p,
                 self.target_scaler(d.unsqueeze(1)),

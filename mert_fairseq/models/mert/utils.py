@@ -103,13 +103,13 @@ def logistic_dist(a, b):
     transforms = [dist.SigmoidTransform().inv, dist.AffineTransform(loc=a, scale=b)]
     return dist.TransformedDistribution(base_distribution, transforms)
 
-def mix_logistic_loss(x, y):
+def mix_logistic_loss(x, y, min_scale=-7.):
     x = x.permute(0, 2, 1)
     y = y.permute(0, 2, 1).squeeze(-1)
     nr_mix = x.shape[-1] // 3
     logit_probs = x[..., :nr_mix]
     mean = x[..., nr_mix : 2 * nr_mix]
-    log_scales = x[..., 2 * nr_mix : 3 * nr_mix].to(torch.float32)
+    log_scales = torch.clamp(x[..., 2 * nr_mix : 3 * nr_mix].to(torch.float32), min_scale)
     z = (y - mean).to(torch.float32) / torch.exp(log_scales)
     mix_probs = F.log_softmax(logit_probs, dim=-1)
     log_probs = -log_scales - 2. * F.softplus(-z)

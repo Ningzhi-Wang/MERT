@@ -26,7 +26,7 @@ from nnAudio import features as nnAudioFeatures
 
 import tqdm
 logger = logging.getLogger(__name__)
-
+logger.setLevel(logging.INFO)
 
 class model_cqt_pred(torch.nn.Module):
     def __init__(self, n_bins=84, sr=16000, freq=50):
