@@ -13,8 +13,8 @@ from pathlib import Path
 from mert_fairseq.models.mert import MERTConfig, MERTModel
 from mert_fairseq.tasks.mert_pretraining import MERTPretrainingTask
 from fairseq import checkpoint_utils
-from mir_bench.datasets import LatentModule
-from mir_bench import tasks
+from musiceval.datasets import LatentModule
+from musiceval import tasks
 
 
 TASK_PATH = {
@@ -34,11 +34,8 @@ TASK_PATH = {
 
 def evaluate(config, ckpt):
     assert ckpt is not None, "Checkpoint must be provided for evaluation"
-    task_names = ["MTT", "Giantsteps", "GTZAN", "EMO"]
-    # tasks = ["MTT", "Giantsteps", "GTZAN", "EMO", "NSynthPitch", "NSynthTimbre"]
-    # tasks = ["NSynthPitch"]
-    # tasks = ["MTGGenre"]
-    # tasks = ["GTZAN"]
+    task_names = config["task_names"]
+    # task_names = ["MTT", "Giantsteps", "GTZAN", "EMO"]
 
     # Perform hyperparameter search as in MERT
     lrs = [1e-4, 1e-3, 1e-2]
@@ -48,9 +45,8 @@ def evaluate(config, ckpt):
 
     train_sizes = [-1]
 
-    # train_sizes = train_sizes.int()
     settings = list(product(lrs, batch_size, drop_outs, l2s))
-    models, _, _ = checkpoint_utils.load_model_ensemble_and_task(["/homes/nw003/workspace/stage0/MERT/models/checkpoint_last.pt"])
+    models, _, _ = checkpoint_utils.load_model_ensemble_and_task([ckpt])
     encoder = models[0]
     encoder.eval()
 
@@ -63,7 +59,6 @@ def evaluate(config, ckpt):
             results = {}
             task_config = config.copy()
             task = eval(f"tasks.{task_name}")(TASK_PATH[task_name], **task_config["task"])
-            # task_config["task"] = task
             data_param = task_config["data"]
             model_param = task_config["model"]
             trainer_param = task_config["trainer"]
