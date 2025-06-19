@@ -1026,6 +1026,8 @@ class MERTModel(BaseFairseqModel):
             return self.hubert_masking(x, *args, **kwargs)
         elif masking_stratgy == 'mae':
             return self.mae_masking(x, *args, **kwargs)
+        else:
+            raise NotImplementedError(f"masking strategy {masking_stratgy} is not implemented")
 
     def hubert_masking(self, x, padding_mask, *args, **kwargs):
         B, T, C = x.shape
@@ -1340,7 +1342,12 @@ class MERTModel(BaseFairseqModel):
         unmasked_features = self.dropout_features(unmasked_features)
 
         if mask:
-            x, masked_indices, nomask_indices = self.apply_mask(features, padding_mask, target_list)
+            x, masked_indices, nomask_indices = self.apply_mask(
+                features, 
+                self.mask_type, 
+                padding_mask, 
+                target_list
+            )
         else:
             x = features
             masked_indices = None
