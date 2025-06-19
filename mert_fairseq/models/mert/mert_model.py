@@ -182,6 +182,7 @@ class MERTConfig(FairseqDataclass):
     )
 
     # masking
+    mask_type: str = field(default="hubert", metadata={"help": "mask type [hubert/mae]"})
     mask_length: int = field(default=10, metadata={"help": "mask length"})
     mask_prob: float = field(
         default=0.65,
@@ -716,6 +717,7 @@ class MERTModel(BaseFairseqModel):
         else:
             self.post_proj_layer_norm = None
 
+        self.mask_type = cfg.mask_type
         self.mask_prob = cfg.mask_prob
         self.mask_selection = cfg.mask_selection
         self.mask_other = cfg.mask_other
@@ -1017,7 +1019,13 @@ class MERTModel(BaseFairseqModel):
 
         return mask_emb_indices, replace_indices, replace_target_indices
 
-    def apply_mask(self, x, padding_mask, target_list):
+    def apply_mask(self, x, masking_stratgy='hubert', *args, **kwargs):
+        if masking_stratgy == 'hubert':
+            return self.hubert_masking(x, *args, **kwargs)
+        elif masking_stratgy == 'mae':
+            return self.mae_masking(x, *args, **kwargs)
+
+    def hubert_masking(self, x, padding_mask, *args, **kwargs):
         B, T, C = x.shape
         if self.mask_prob > 0:
             mask_indices = compute_mask_indices(
@@ -1078,8 +1086,41 @@ class MERTModel(BaseFairseqModel):
                 .expand(-1, T, -1)
             )
             x[mask_channel_indices] = 0
+        masked_indices = torch.logical_and(~padding_mask, mask_indices)
+        nomasked_indices = torch.logical_and(~padding_mask, ~mask_indices) 
+        # return x, mask_indices
+        return x, masked_indices, nomasked_indices
 
-        return x, mask_indices
+
+
+    def mae_masking(self, x, padding_mask, *args, **kwargs):
+        """
+        Perform per-sample random masking by per-sample shuffling.
+        Per-sample shuffling is done by argsort random noise.
+        x: [N, L, D], sequence
+        """
+        N, L, D = x.shape  # batch, length, dim
+        len_keep = int(L * (1 - self.mask_prob))
+    
+        noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+    
+        # sort noise for each sample
+        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # keep the first subset
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+        masked_indices = torch.logical_and(~padding_mask, mask)
+        nomasked_indices = torch.logical_and(~padding_mask, ~mask) 
+
+        return x_masked, masked_indices, nomasked_indices
 
     def compute_nce(self, x, pos, negs):
         neg_is_pos = (pos == negs).all(-1)
@@ -1297,10 +1338,11 @@ class MERTModel(BaseFairseqModel):
         unmasked_features = self.dropout_features(unmasked_features)
 
         if mask:
-            x, mask_indices = self.apply_mask(features, padding_mask, target_list)
+            x, masked_indices, nomask_indices = self.apply_mask(features, padding_mask, target_list)
         else:
             x = features
-            mask_indices = None
+            masked_indices = None
+            nomask_indices = None
 
         # feature: (B, T, D), float
         # target: (B, T), long
@@ -1342,11 +1384,12 @@ class MERTModel(BaseFairseqModel):
         label_embs_list = self.label_embs_concat.split(self.num_classes, 0)
 
         if not self.skip_masked:
-            masked_indices = torch.logical_and(~padding_mask, mask_indices)
+            # masked_indices = torch.logical_and(~padding_mask, mask_indices)
+            masked_x = x[masked_indices] if self.mask_type == "hubert" else x
 
             # @yizhilll: TODO merge the codes heredui
             if self.random_codebook <= 0:
-                proj_x_m = self.final_proj(x[masked_indices])
+                proj_x_m = self.final_proj(masked_x)
                 if self.untie_final_proj:
                     proj_x_m_list = proj_x_m.chunk(len(target_list), dim=-1)
                 else:
@@ -1362,9 +1405,9 @@ class MERTModel(BaseFairseqModel):
                 for i in range(len(target_list)):
                     if i in selected_books:
                         if self.untie_final_proj:
-                            proj_x_m_list.append(self.final_projs[i](x[masked_indices]))
+                            proj_x_m_list.append(self.final_projs[i](masked_x))
                         else:
-                            proj_x_m_list.append(self.final_proj(x[masked_indices]))
+                            proj_x_m_list.append(self.final_proj(masked_x))
                     else:
                         proj_x_m_list.append(None)
 
@@ -1399,8 +1442,8 @@ class MERTModel(BaseFairseqModel):
         else:
             logit_m_list = [None for _ in target_list]
 
-        if not self.skip_nomask:
-            nomask_indices = torch.logical_and(~padding_mask, ~mask_indices)
+        if not self.skip_nomask and self.mask_type == "hubert":
+            # nomask_indices = torch.logical_and(~padding_mask, ~mask_indices)
             proj_x_u = self.final_proj(x[nomask_indices])
             if self.untie_final_proj:
                 proj_x_u_list = proj_x_u.chunk(len(target_list), dim=-1)
@@ -1428,6 +1471,7 @@ class MERTModel(BaseFairseqModel):
         }
 
         if self.cfg.audio_cqt_loss_m:
+            masked_x = x[masked_indices] if self.mask_type == "hubert" else x
             if cqt_labels is not None:
                 cqt_targets = cqt_labels[
                     : masked_indices.shape[0], : masked_indices.shape[1]
@@ -1448,7 +1492,7 @@ class MERTModel(BaseFairseqModel):
                 else "masked_transformer_output"
             )
             cqt_pred_m = self.encoder_cqt_model(
-                x[masked_indices], forward_type=cqt_forward_type
+                masked_x, forward_type=cqt_forward_type
             )
             # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape)
             cqt_loss_m = self.encoder_cqt_model.criterion(
@@ -1457,6 +1501,7 @@ class MERTModel(BaseFairseqModel):
             result["cqt_pred_m"] = cqt_loss_m
 
         if self.cfg.audio_mel_loss_m:
+            masked_x = x[masked_indices] if self.mask_type == "hubert" else x
             if mel_labels is not None:
                 mel_targets = mel_labels[
                     : masked_indices.shape[0], : masked_indices.shape[1]
@@ -1471,7 +1516,7 @@ class MERTModel(BaseFairseqModel):
                     : masked_indices.shape[0], : masked_indices.shape[1]
                 ]  # dump the last
 
-            mel_pred_m = self.encoder_mel_model(x[masked_indices])
+            mel_pred_m = self.encoder_mel_model(masked_x)
             # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape)
             mel_loss_m = self.encoder_mel_model.criterion(
                 mel_pred_m, mel_targets[masked_indices]
