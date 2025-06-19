@@ -18,11 +18,11 @@ from musiceval import tasks
 
 
 TASK_PATH = {
-    "MTT": "/import/c4dm-05/nw003/datasets/mtt",
-    "GTZAN": "/import/c4dm-05/nw003/datasets/gtzan",
-    "EMO": "/import/c4dm-05/nw003/datasets/musicemo",
-    "Giantsteps": "/import/c4dm-05/nw003/datasets/giantstep",
-    "NSynthPitch": "/import/c4dm-datasets/nsynth",
+    "MTT": "/data/scratch/acw713/datasets/mtt",
+    "GTZAN": "/data/scratch/acw713/datasets/gtzan",
+    "EMO": "/data/scratch/acw713/datasets/musicemo",
+    "Giantsteps": "/data/scratch/acw713/datasets/giantsteps",
+    "NSynthPitch": "/data/scratch/acw713/datasets/nsynth",
     "NSynthTimbre": "/data/scratch/acw713/datasets/nsynth",
     "MEDLEYDB": "/data/scratch/acw713/datasets/medleydb/V1/",
     "MTGGenre": "/data/scratch/acw713/datasets/mtg/",
@@ -35,13 +35,12 @@ TASK_PATH = {
 def evaluate(config, ckpt):
     assert ckpt is not None, "Checkpoint must be provided for evaluation"
     task_names = config["task_names"]
-    # task_names = ["MTT", "Giantsteps", "GTZAN", "EMO"]
 
     # Perform hyperparameter search as in MERT
-    lrs = [1e-4, 1e-3, 1e-2]
+    lrs = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2]
     batch_size = [64]
     drop_outs = [0.25]
-    l2s = [0, 1e-2]
+    l2s = [0]
 
     train_sizes = [-1]
 

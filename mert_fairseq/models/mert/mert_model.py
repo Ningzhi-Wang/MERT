@@ -43,7 +43,7 @@ import os
 import math
 
 from nnAudio import features as nnAudioFeatures
-from .utils import discretized_mix_logistic_loss, get_scaler
+from .utils import discretized_mix_logistic_loss, get_scaler, mix_logistic_loss
 
 logger = logging.getLogger(__name__)
 
@@ -573,16 +573,17 @@ class model_cqt_pred(torch.nn.Module):
 
         # 1-layer version
         if logistic:
-            self.fc = nn.Sequential(
-                nn.Linear(input_dim, n_bins * 30),
-                nn.Tanh()
-            )
-            # self.conv = nn.Sequential(
-            #     nn.Conv1d(1, 30, 1, 1, 0),
-            #     nn.ELU(),
-            #     LayerNorm(input_dim, elementwise_affine=False)
+            # self.fc = nn.Sequential(
+            #     nn.Linear(input_dim, 120),
+            #     nn.Linear(input_dim, n_bins * 30),
+            #     nn.Tanh()
             # )
-            # self.fc = nn.Sequential(nn.Linear(input_dim, n_bins), nn.Tanh())
+            self.fc = nn.Sequential(nn.Linear(input_dim, n_bins), nn.ReLU(), nn.BatchNorm1d(n_bins))
+            self.conv = nn.Sequential(
+                nn.Conv1d(1, 30, 3, 1, 1),
+                nn.Tanh()
+                # LayerNorm(input_dim, elementwise_affine=False)
+            )
             self.target_scaler = get_scaler(init_min=-1e-4, init_max=45)
             self.criterion = lambda p, d: discretized_mix_logistic_loss(
                 p,
@@ -627,11 +628,12 @@ class model_cqt_pred(torch.nn.Module):
         take input from transformer hidden states: [batch * len_seq, channel]
         output: [batch * len_seq, n_bins]
         """
-        # x = x.unsqueeze(1)
-        # x = self.conv(x)
-        # x = self.fc(x)
         x = self.fc(x)
-        return x.view(-1, 30, self.n_bins)
+        x = x.unsqueeze(1)
+        x = self.conv(x)
+        return x
+        # x = self.fc(x)
+        # return x.view(-1, 30, self.n_bins)
 
     def plain_forward(self, x):
         """
