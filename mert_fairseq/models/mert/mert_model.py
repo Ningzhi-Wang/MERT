@@ -581,7 +581,7 @@ class model_cqt_pred(torch.nn.Module):
             self.fc = nn.Sequential(nn.Linear(input_dim, n_bins), nn.ReLU(), nn.BatchNorm1d(n_bins))
             self.conv = nn.Sequential(
                 nn.Conv1d(1, 30, 3, 1, 1),
-                nn.Tanh()
+                # nn.Tanh()
                 # LayerNorm(input_dim, elementwise_affine=False)
             )
             self.target_scaler = get_scaler(init_min=-1e-4, init_max=45)
