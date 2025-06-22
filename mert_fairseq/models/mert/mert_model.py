@@ -38,12 +38,18 @@ from fairseq.tasks.hubert_pretraining import (
     HubertPretrainingConfig,
     HubertPretrainingTask,
 )
+from timm.models.vision_transformer import Block
 
 import os
 import math
 
 from nnAudio import features as nnAudioFeatures
-from .utils import discretized_mix_logistic_loss, get_scaler, mix_logistic_loss
+from .utils import (
+    discretized_mix_logistic_loss, 
+    get_scaler, 
+    mix_logistic_loss,
+    get_1d_sincos_pos_embed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -778,7 +784,7 @@ class MERTModel(BaseFairseqModel):
             self.encoder = TransformerEncoder_extend(cfg)
 
         else:
-            self.encoder = TransformerEncoder(cfg)
+            self.encoder = TransformerEncoder(cfg, skip_pos_conv=self.mask_type == "mae")
 
         if self.do_cnn_feat_stable_layernorm:
             self.layer_norm = LayerNorm(self.embed, elementwise_affine=False)
@@ -900,6 +906,21 @@ class MERTModel(BaseFairseqModel):
                 self.feature_extractor.eval()
             # for param in self.feature_extractor.parameters():
             #     param.requires_grad = False
+
+        if self.mask_type == "mae":
+            # mae need extra embeddings for the decoder 
+            decoder_pos_emb = get_1d_sincos_pos_embed(
+                # fixed time length for now, need to be changed later
+                cfg.encoder_embed_dim, torch.arange(374)
+            )
+            self.register_buffer("decoder_pos_emb", decoder_pos_emb)
+            decoder_blocks = [
+                Block(cfg.encoder_embed_dim, 8, 4., qkv_bias=True, norm_layer=LayerNorm)
+            ] * 8
+            self.decoder = nn.Sequential(*decoder_blocks)
+            self.decoder_layer_norm = LayerNorm(
+                cfg.encoder_embed_dim, elementwise_affine=False
+            )  
 
     def inbatch_noise_augment(
         self,
@@ -1102,6 +1123,10 @@ class MERTModel(BaseFairseqModel):
         Perform per-sample random masking by per-sample shuffling.
         Per-sample shuffling is done by argsort random noise.
         x: [N, L, D], sequence
+        return: 
+            masked_x: x with only kept tokens, [N, M, D]
+            masked_indices: binary mask, 0 is keep, 1 is remove, [N, L]
+            restore_indices: Indices to restore shuffled tokens to original order, [N, L]
         """
         N, L, D = x.shape  # batch, length, dim
         len_keep = int(L * (1 - self.mask_prob))
@@ -1122,9 +1147,8 @@ class MERTModel(BaseFairseqModel):
         # unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
         masked_indices = torch.logical_and(~padding_mask, mask)
-        nomasked_indices = torch.logical_and(~padding_mask, ~mask) 
 
-        return x_masked, masked_indices, nomasked_indices
+        return x_masked, masked_indices, ids_restore
 
     def compute_nce(self, x, pos, negs):
         neg_is_pos = (pos == negs).all(-1)
@@ -1348,10 +1372,12 @@ class MERTModel(BaseFairseqModel):
                 padding_mask, 
                 target_list
             )
+            masked_padding_mask = padding_mask if self.mask_type != "mae" else None
         else:
             x = features
             masked_indices = None
             nomask_indices = None
+            masked_padding_mask = padding_mask
 
         # feature: (B, T, D), float
         # target: (B, T), long
@@ -1360,7 +1386,7 @@ class MERTModel(BaseFairseqModel):
         # mask_indices: (B, T), bool
         x, layer_results = self.encoder(
             x,
-            padding_mask=padding_mask,
+            padding_mask=masked_padding_mask,
             layer=None if output_layer is None else output_layer - 1,
         )
 
@@ -1370,7 +1396,24 @@ class MERTModel(BaseFairseqModel):
                 "padding_mask": padding_mask,
                 "features": features,
                 "layer_results": layer_results,
+                "masked_indices": masked_indices,
+                "id_restore": nomask_indices,
             }
+
+        if self.mask_type == "mae":
+            masked_tokens = self.mask_emb.expand(
+                x.shape[0], nomask_indices.shape[1] - x.shape[1], -1, 
+            )
+            x = torch.cat(
+                (x, masked_tokens), dim=1
+            )
+            restore_indices = nomask_indices.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
+            x = torch.gather(x, dim=1, index=restore_indices)
+            x = x + self.decoder_pos_emb
+            x = self.decoder(x)
+            x = self.decoder_layer_norm(x)
+
+
 
         def compute_pred(proj_x, target, label_embs, logit_temp=None):
             # skip the codebook that is not selected
@@ -1392,13 +1435,12 @@ class MERTModel(BaseFairseqModel):
 
         label_embs_list = self.label_embs_concat.split(self.num_classes, 0)
 
+
         if not self.skip_masked:
             # masked_indices = torch.logical_and(~padding_mask, mask_indices)
-            masked_x = x[masked_indices] if self.mask_type == "hubert" else x
-
             # @yizhilll: TODO merge the codes heredui
             if self.random_codebook <= 0:
-                proj_x_m = self.final_proj(masked_x)
+                proj_x_m = self.final_proj(x[masked_indices])
                 if self.untie_final_proj:
                     proj_x_m_list = proj_x_m.chunk(len(target_list), dim=-1)
                 else:
@@ -1414,9 +1456,9 @@ class MERTModel(BaseFairseqModel):
                 for i in range(len(target_list)):
                     if i in selected_books:
                         if self.untie_final_proj:
-                            proj_x_m_list.append(self.final_projs[i](masked_x))
+                            proj_x_m_list.append(self.final_projs[i](x[masked_indices]))
                         else:
-                            proj_x_m_list.append(self.final_proj(masked_x))
+                            proj_x_m_list.append(self.final_proj(x[masked_indices]))
                     else:
                         proj_x_m_list.append(None)
 
@@ -1480,7 +1522,7 @@ class MERTModel(BaseFairseqModel):
         }
 
         if self.cfg.audio_cqt_loss_m:
-            masked_x = x[masked_indices] if self.mask_type == "hubert" else x
+
             if cqt_labels is not None:
                 cqt_targets = cqt_labels[
                     : masked_indices.shape[0], : masked_indices.shape[1]
@@ -1501,7 +1543,7 @@ class MERTModel(BaseFairseqModel):
                 else "masked_transformer_output"
             )
             cqt_pred_m = self.encoder_cqt_model(
-                masked_x, forward_type=cqt_forward_type
+                x[masked_indices], forward_type=cqt_forward_type
             )
             # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape)
             cqt_loss_m = self.encoder_cqt_model.criterion(
@@ -1510,7 +1552,6 @@ class MERTModel(BaseFairseqModel):
             result["cqt_pred_m"] = cqt_loss_m
 
         if self.cfg.audio_mel_loss_m:
-            masked_x = x[masked_indices] if self.mask_type == "hubert" else x
             if mel_labels is not None:
                 mel_targets = mel_labels[
                     : masked_indices.shape[0], : masked_indices.shape[1]
@@ -1525,7 +1566,7 @@ class MERTModel(BaseFairseqModel):
                     : masked_indices.shape[0], : masked_indices.shape[1]
                 ]  # dump the last
 
-            mel_pred_m = self.encoder_mel_model(masked_x)
+            mel_pred_m = self.encoder_mel_model(x[masked_indices])
             # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape)
             mel_loss_m = self.encoder_mel_model.criterion(
                 mel_pred_m, mel_targets[masked_indices]
@@ -1705,8 +1746,8 @@ class TransformerEncoder_extend(TransformerEncoder):
             layer = checkpoint_wrapper(layer)
         return layer
 
-    def __init__(self, args: MERTConfig):
-        super().__init__(args)
+    def __init__(self, args: MERTConfig, skip_pos_conv: bool = False):
+        super().__init__(args, skip_pos_conv=skip_pos_conv)
 
         if args.deepnorm:
             # if is_encoder_decoder:

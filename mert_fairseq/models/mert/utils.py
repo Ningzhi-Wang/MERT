@@ -115,3 +115,24 @@ def mix_logistic_loss(x, y, min_scale=-7.):
     log_probs = -log_scales - 2. * F.softplus(-z)
     loss = -torch.logsumexp(log_probs + mix_probs, dim=-1).mean(dim=1)
     return loss.mean().to(torch.float16)
+
+
+def get_1d_sincos_pos_embed(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (M,)
+    out: (M, D)
+    """
+    assert embed_dim % 2 == 0
+    omega = torch.arange(embed_dim // 2, dtype=pos.dtype, device=pos.device)
+    omega = omega / embed_dim * 2.
+    omega = 1. / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = torch.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+
+    emb_sin = torch.sin(out) # (M, D/2)
+    emb_cos = torch.cos(out) # (M, D/2)
+
+    emb = torch.concatenate([emb_sin, emb_cos], dim=1)  # (M, D)
+    return emb
