@@ -591,7 +591,7 @@ class model_cqt_pred(torch.nn.Module):
                 # LayerNorm(input_dim, elementwise_affine=False)
             )
             self.target_scaler = get_scaler(init_min=-1e-4, init_max=45)
-            self.criterion = lambda p, d: discretized_mix_logistic_loss(
+            self.criterion = lambda p, d: mix_logistic_loss(
                 p,
                 self.target_scaler(d.unsqueeze(1)),
             )
@@ -1409,7 +1409,7 @@ class MERTModel(BaseFairseqModel):
             )
             restore_indices = nomask_indices.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
             x = torch.gather(x, dim=1, index=restore_indices)
-            x = x + self.decoder_pos_emb
+            x = x + self.decoder_pos_emb[:nomask_indices.shape[1], :]
             x = self.decoder(x)
             x = self.decoder_layer_norm(x)
 
