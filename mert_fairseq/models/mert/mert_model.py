@@ -54,7 +54,8 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 MASK_REPLACE_TYPE_CHOICES = ChoiceEnum(["in_batch", "in_sample"])
-AUDIO_FEAT_EXTRACTOR_TYPE_CHOICES = ChoiceEnum(["w2v_conv", "hstft_conv"])
+AUDIO_FEAT_EXTRACTOR_TYPE_CHOICES = ChoiceEnum(["w2v_conv", "hstft_conv", "mae_conv"])
+INPUT_TYPE_CHOICES = ChoiceEnum(["audio", "spectrogram"])
 
 
 @dataclass
@@ -703,6 +704,11 @@ class MERTModel(BaseFairseqModel):
                 mode=cfg.extractor_mode,
                 conv_bias=cfg.conv_bias,
             )
+        elif cfg.audio_extract_type == "mae_conv":
+            # This feature extractor expect spectrograms as input 
+            self.feature_extractor = nn.Conv2d(
+                1, 1
+            )
 
         self.embed = feature_enc_layers[-1][0]
         if self.cfg.feature_extractor_cqt:
@@ -781,7 +787,7 @@ class MERTModel(BaseFairseqModel):
             if cfg.deepnorm:
                 assert not cfg.layer_norm_first
 
-            self.encoder = TransformerEncoder_extend(cfg)
+            self.encoder = TransformerEncoder_extend(cfg, skip_pos_conv=self.mask_type == "mae")
 
         else:
             self.encoder = TransformerEncoder(cfg, skip_pos_conv=self.mask_type == "mae")
@@ -909,11 +915,11 @@ class MERTModel(BaseFairseqModel):
 
         if self.mask_type == "mae":
             # mae need extra embeddings for the decoder 
-            decoder_pos_emb = get_1d_sincos_pos_embed(
+            pos_emb = get_1d_sincos_pos_embed(
                 # fixed time length for now, need to be changed later
                 cfg.encoder_embed_dim, torch.arange(374)
             )
-            self.register_buffer("decoder_pos_emb", decoder_pos_emb)
+            self.register_buffer("pos_emb", pos_emb)
             decoder_blocks = [
                 Block(cfg.encoder_embed_dim, 8, 4., qkv_bias=True, norm_layer=LayerNorm)
             ] * 8
@@ -1365,6 +1371,9 @@ class MERTModel(BaseFairseqModel):
         features = self.dropout_input(features)
         unmasked_features = self.dropout_features(unmasked_features)
 
+        if self.mask_type == "mae":
+            features = features + self.pos_emb[:features.shape[1], :]
+
         if mask:
             x, masked_indices, nomask_indices = self.apply_mask(
                 features, 
@@ -1384,6 +1393,7 @@ class MERTModel(BaseFairseqModel):
         # x: (B, T, D), float
         # padding_mask: (B, T), bool
         # mask_indices: (B, T), bool
+
         x, layer_results = self.encoder(
             x,
             padding_mask=masked_padding_mask,
@@ -1409,7 +1419,7 @@ class MERTModel(BaseFairseqModel):
             )
             restore_indices = nomask_indices.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
             x = torch.gather(x, dim=1, index=restore_indices)
-            x = x + self.decoder_pos_emb[:nomask_indices.shape[1], :]
+            x = x + self.pos_emb[:nomask_indices.shape[1], :]
             x = self.decoder(x)
             x = self.decoder_layer_norm(x)
 
