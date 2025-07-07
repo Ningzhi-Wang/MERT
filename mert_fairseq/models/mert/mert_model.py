@@ -32,6 +32,7 @@ from fairseq.models.wav2vec.wav2vec2 import (
     TransformerEncoder,
     TransformerSentenceEncoderLayer,
     ConformerWav2Vec2EncoderLayer,
+    make_conv_pos,
 )
 from fairseq.modules import GradMultiply, LayerNorm, MultiheadAttention
 from fairseq.tasks.hubert_pretraining import (
@@ -45,8 +46,8 @@ import math
 
 from nnAudio import features as nnAudioFeatures
 from .utils import (
-    discretized_mix_logistic_loss, 
-    get_scaler, 
+    discretized_mix_logistic_loss,
+    get_scaler,
     mix_logistic_loss,
     get_1d_sincos_pos_embed,
 )
@@ -54,7 +55,7 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 MASK_REPLACE_TYPE_CHOICES = ChoiceEnum(["in_batch", "in_sample"])
-AUDIO_FEAT_EXTRACTOR_TYPE_CHOICES = ChoiceEnum(["w2v_conv", "hstft_conv", "mae_conv"])
+AUDIO_FEAT_EXTRACTOR_TYPE_CHOICES = ChoiceEnum(["w2v_conv", "hstft_conv", "spec_mlp"])
 INPUT_TYPE_CHOICES = ChoiceEnum(["audio", "spectrogram"])
 
 
@@ -189,7 +190,9 @@ class MERTConfig(FairseqDataclass):
     )
 
     # masking
-    mask_type: str = field(default="hubert", metadata={"help": "mask type [hubert/mae]"})
+    mask_type: str = field(
+        default="hubert", metadata={"help": "mask type [hubert/mae]"}
+    )
     mask_length: int = field(default=10, metadata={"help": "mask length"})
     mask_prob: float = field(
         default=0.65,
@@ -585,7 +588,9 @@ class model_cqt_pred(torch.nn.Module):
             #     nn.Linear(input_dim, n_bins * 30),
             #     nn.Tanh()
             # )
-            self.fc = nn.Sequential(nn.Linear(input_dim, n_bins), nn.ReLU(), nn.BatchNorm1d(n_bins))
+            self.fc = nn.Sequential(
+                nn.Linear(input_dim, n_bins), nn.ReLU(), nn.BatchNorm1d(n_bins)
+            )
             self.conv = nn.Sequential(
                 nn.Conv1d(1, 30, 3, 1, 1),
                 # nn.Tanh()
@@ -704,10 +709,25 @@ class MERTModel(BaseFairseqModel):
                 mode=cfg.extractor_mode,
                 conv_bias=cfg.conv_bias,
             )
-        elif cfg.audio_extract_type == "mae_conv":
-            # This feature extractor expect spectrograms as input 
-            self.feature_extractor = nn.Conv2d(
-                1, 1
+        elif cfg.audio_extract_type == "spec_mlp":
+            # This feature extractor converts inputs to mel-spectrograms and use mlp to match dimension.
+            self.mel_extractor = nnAudioFeatures.mel.MelSpectrogram(
+                sample_rate=task_cfg.sample_rate,
+                n_fft=2048,
+                hop_length=task_cfg.sample_rate // cfg.label_rate,
+                fmin=32.7,
+                fmax=None,
+                n_mels=cfg.audio_mel_bins,
+                window_fn=torch.hann_window,
+                center=True,
+                pad_mode="constant",
+                mel_scale="htk",
+                normalized=True,
+            )
+            self.feature_extractor = nn.Conv2d(1, 1)
+        else:
+            raise NotImplementedError(
+                "Only w2v_conv and spec_mlp are supported for now"
             )
 
         self.embed = feature_enc_layers[-1][0]
@@ -787,10 +807,14 @@ class MERTModel(BaseFairseqModel):
             if cfg.deepnorm:
                 assert not cfg.layer_norm_first
 
-            self.encoder = TransformerEncoder_extend(cfg, skip_pos_conv=self.mask_type == "mae")
+            self.encoder = TransformerEncoder_extend(
+                cfg, skip_pos_conv=self.mask_type == "mae"
+            )
 
         else:
-            self.encoder = TransformerEncoder(cfg, skip_pos_conv=self.mask_type == "mae")
+            self.encoder = TransformerEncoder(
+                cfg, skip_pos_conv=self.mask_type == "mae"
+            )
 
         if self.do_cnn_feat_stable_layernorm:
             self.layer_norm = LayerNorm(self.embed, elementwise_affine=False)
@@ -914,19 +938,28 @@ class MERTModel(BaseFairseqModel):
             #     param.requires_grad = False
 
         if self.mask_type == "mae":
-            # mae need extra embeddings for the decoder 
-            pos_emb = get_1d_sincos_pos_embed(
-                # fixed time length for now, need to be changed later
-                cfg.encoder_embed_dim, torch.arange(374)
-            )
-            self.register_buffer("pos_emb", pos_emb)
+            # mae need extra embeddings for both encoder and decoder inputs
+            # pos_emb = get_1d_sincos_pos_embed(
+            #     # fixed time length for now, need to be changed later
+            #     cfg.encoder_embed_dim,
+            #     torch.arange(374),
+            # )
+            # self.register_buffer("pos_emb", pos_emb)
+            self.enc_pos_conv = make_conv_pos(
+                cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
+            self.dec_pos_conv = make_conv_pos(
+                cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
+
+            # MAE decoder
             decoder_blocks = [
-                Block(cfg.encoder_embed_dim, 8, 4., qkv_bias=True, norm_layer=LayerNorm)
+                Block(
+                    cfg.encoder_embed_dim, 8, 4.0, qkv_bias=True, norm_layer=LayerNorm
+                )
             ] * 8
             self.decoder = nn.Sequential(*decoder_blocks)
             self.decoder_layer_norm = LayerNorm(
                 cfg.encoder_embed_dim, elementwise_affine=False
-            )  
+            )
 
     def inbatch_noise_augment(
         self,
@@ -1048,13 +1081,15 @@ class MERTModel(BaseFairseqModel):
 
         return mask_emb_indices, replace_indices, replace_target_indices
 
-    def apply_mask(self, x, masking_stratgy='hubert', *args, **kwargs):
-        if masking_stratgy == 'hubert':
+    def apply_mask(self, x, masking_stratgy="hubert", *args, **kwargs):
+        if masking_stratgy == "hubert":
             return self.hubert_masking(x, *args, **kwargs)
-        elif masking_stratgy == 'mae':
+        elif masking_stratgy == "mae":
             return self.mae_masking(x, *args, **kwargs)
         else:
-            raise NotImplementedError(f"masking strategy {masking_stratgy} is not implemented")
+            raise NotImplementedError(
+                f"masking strategy {masking_stratgy} is not implemented"
+            )
 
     def hubert_masking(self, x, padding_mask, *args, **kwargs):
         B, T, C = x.shape
@@ -1118,34 +1153,35 @@ class MERTModel(BaseFairseqModel):
             )
             x[mask_channel_indices] = 0
         masked_indices = torch.logical_and(~padding_mask, mask_indices)
-        nomasked_indices = torch.logical_and(~padding_mask, ~mask_indices) 
+        nomasked_indices = torch.logical_and(~padding_mask, ~mask_indices)
         # return x, mask_indices
-        return x, masked_indices, nomasked_indices
-
-
+        return x, masked_indices, nomasked_indices, padding_mask
 
     def mae_masking(self, x, padding_mask, *args, **kwargs):
         """
         Perform per-sample random masking by per-sample shuffling.
         Per-sample shuffling is done by argsort random noise.
         x: [N, L, D], sequence
-        return: 
+        return:
             masked_x: x with only kept tokens, [N, M, D]
             masked_indices: binary mask, 0 is keep, 1 is remove, [N, L]
             restore_indices: Indices to restore shuffled tokens to original order, [N, L]
         """
         N, L, D = x.shape  # batch, length, dim
         len_keep = int(L * (1 - self.mask_prob))
-    
+
         noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
-    
+
         # sort noise for each sample
-        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        ids_shuffle = torch.argsort(
+            noise, dim=1
+        )  # ascend: small is keep, large is remove
         ids_restore = torch.argsort(ids_shuffle, dim=1)
 
         # keep the first subset
         ids_keep = ids_shuffle[:, :len_keep]
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        masked_padding_mask = torch.gather(padding_mask, dim=1, index=ids_keep)
 
         # generate the binary mask: 0 is keep, 1 is remove
         mask = torch.ones([N, L], device=x.device)
@@ -1154,7 +1190,7 @@ class MERTModel(BaseFairseqModel):
         mask = torch.gather(mask, dim=1, index=ids_restore)
         masked_indices = torch.logical_and(~padding_mask, mask)
 
-        return x_masked, masked_indices, ids_restore
+        return x_masked, masked_indices, ids_restore, masked_padding_mask 
 
     def compute_nce(self, x, pos, negs):
         neg_is_pos = (pos == negs).all(-1)
@@ -1212,6 +1248,10 @@ class MERTModel(BaseFairseqModel):
             logits[1:][neg_is_pos] = float("-inf")
         logits = logits.transpose(0, 1)  # (num_x, num_cls+1)
         return logits
+
+    def patchfy_extractor(self, x):
+        # B, F, T
+        mel_x = self.mel_extractor(x)
 
     def forward_features(self, source: torch.Tensor) -> torch.Tensor:
         """
@@ -1372,16 +1412,14 @@ class MERTModel(BaseFairseqModel):
         unmasked_features = self.dropout_features(unmasked_features)
 
         if self.mask_type == "mae":
-            features = features + self.pos_emb[:features.shape[1], :]
+            # features = features + self.pos_emb[:features.shape[1], :]
+            features = features + self.enc_pos_conv(features.transpose(1, 2)).transpose(1, 2)
 
         if mask:
-            x, masked_indices, nomask_indices = self.apply_mask(
-                features, 
-                self.mask_type, 
-                padding_mask, 
-                target_list
+            x, masked_indices, nomask_indices, masked_padding_mask = self.apply_mask(
+                features, self.mask_type, padding_mask, target_list
             )
-            masked_padding_mask = padding_mask if self.mask_type != "mae" else None
+            # masked_padding_mask = padding_mask if self.mask_type != "mae" else padding_mask[masked_indices]
         else:
             x = features
             masked_indices = None
@@ -1412,18 +1450,19 @@ class MERTModel(BaseFairseqModel):
 
         if self.mask_type == "mae":
             masked_tokens = self.mask_emb.expand(
-                x.shape[0], nomask_indices.shape[1] - x.shape[1], -1, 
+                x.shape[0],
+                nomask_indices.shape[1] - x.shape[1],
+                -1,
             )
-            x = torch.cat(
-                (x, masked_tokens), dim=1
+            x = torch.cat((x, masked_tokens), dim=1)
+            restore_indices = (
+                nomask_indices.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
             )
-            restore_indices = nomask_indices.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
             x = torch.gather(x, dim=1, index=restore_indices)
-            x = x + self.pos_emb[:nomask_indices.shape[1], :]
+            # x = x + self.pos_emb[:nomask_indices.shape[1], :]
+            x = x + self.dec_pos_conv(x.transpose(1, 2)).transpose(1, 2)
             x = self.decoder(x)
             x = self.decoder_layer_norm(x)
-
-
 
         def compute_pred(proj_x, target, label_embs, logit_temp=None):
             # skip the codebook that is not selected
@@ -1444,7 +1483,6 @@ class MERTModel(BaseFairseqModel):
                 return self.compute_nce(proj_x, y, negs)
 
         label_embs_list = self.label_embs_concat.split(self.num_classes, 0)
-
 
         if not self.skip_masked:
             # masked_indices = torch.logical_and(~padding_mask, mask_indices)
