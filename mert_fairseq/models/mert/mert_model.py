@@ -955,7 +955,7 @@ class MERTModel(BaseFairseqModel):
                 Block(
                     cfg.encoder_embed_dim, 8, 4.0, qkv_bias=True, norm_layer=LayerNorm
                 )
-            ] * 8
+            for _ in range(8)] 
             self.decoder = nn.Sequential(*decoder_blocks)
             self.decoder_layer_norm = LayerNorm(
                 cfg.encoder_embed_dim, elementwise_affine=False
