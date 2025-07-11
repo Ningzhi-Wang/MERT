@@ -39,7 +39,7 @@ from fairseq.tasks.hubert_pretraining import (
     HubertPretrainingConfig,
     HubertPretrainingTask,
 )
-from timm.models.vision_transformer import Block
+from timm.models.vision_transformer import Block, PatchEmbed
 
 import os
 import math
@@ -364,7 +364,7 @@ class MERTConfig(FairseqDataclass):
         default=84,
         metadata={"help": "the bins of CQT feature"},
     )
-    # mel loss
+    # mel loss and mel extractor
     audio_mel_loss_m: bool = field(
         default=False,
         metadata={"help": "whether to predict the CQT of the audio of masked pard"},
@@ -373,7 +373,6 @@ class MERTConfig(FairseqDataclass):
         default=84,
         metadata={"help": "the bins of CQT feature"},
     )
-
     # cqt extractor
     feature_extractor_cqt: bool = field(
         default=False,
@@ -683,6 +682,7 @@ class MERTModel(BaseFairseqModel):
         feature_enc_layers = eval(cfg.conv_feature_layers)  # noqa
         # ? why not just save the whole cfg?? maybe it's because the datatype inside the cfg cant'be changed? since there's eval()
         self.cfg = cfg
+        self.embed = feature_enc_layers[-1][0]
 
         if self.cfg.feature_extractor_cqt:
             self.feature_extractor_cqt = nnAudioFeatures.cqt.CQT(
@@ -712,25 +712,26 @@ class MERTModel(BaseFairseqModel):
         elif cfg.audio_extract_type == "spec_mlp":
             # This feature extractor converts inputs to mel-spectrograms and use mlp to match dimension.
             self.mel_extractor = nnAudioFeatures.mel.MelSpectrogram(
-                sample_rate=task_cfg.sample_rate,
+                sr=task_cfg.sample_rate,
                 n_fft=2048,
-                hop_length=task_cfg.sample_rate // cfg.label_rate,
+                hop_length=int(task_cfg.sample_rate // cfg.label_rate),
                 fmin=32.7,
                 fmax=None,
                 n_mels=cfg.audio_mel_bins,
-                window_fn=torch.hann_window,
+                window="hann",
                 center=True,
                 pad_mode="constant",
-                mel_scale="htk",
-                normalized=True,
+                htk=True,
+                norm=True,
             )
-            self.feature_extractor = nn.Conv2d(1, 1)
+            self.patch_embed = PatchEmbed(None, patch_size=16, in_chans=1, embed_dim=self.embed, dynamic_img_pad=True)
+            # self.feature_extractor = nn.Conv2d(1, 1)
+            self.feature_extractor = self.patchfy_extractor
         else:
             raise NotImplementedError(
                 "Only w2v_conv and spec_mlp are supported for now"
             )
 
-        self.embed = feature_enc_layers[-1][0]
         if self.cfg.feature_extractor_cqt:
             self.embed = feature_enc_layers[-1][0] + cfg.feature_extractor_cqt_bins
 
@@ -1252,6 +1253,9 @@ class MERTModel(BaseFairseqModel):
     def patchfy_extractor(self, x):
         # B, F, T
         mel_x = self.mel_extractor(x)
+        # B, L, D
+        patches = self.patch_embed(mel_x.unsqueeze(1))
+        return patches.permute(0, 2, 1)  # B, D, L
 
     def forward_features(self, source: torch.Tensor) -> torch.Tensor:
         """
