@@ -11,7 +11,7 @@ def discretized_mix_logistic_loss(
     pred: torch.Tensor,
     data: torch.Tensor,
     num_classes: int = 256,
-    log_scale_min: float = -7.0,
+    log_scale_min: float = -6.0,
 ):
     """Discretized mix of logistic distributions loss.
     Note that it is assumed that input is scaled to [-1, 1]
@@ -29,7 +29,7 @@ def discretized_mix_logistic_loss(
     # unpack paramteres: distribution probability, mean, log scale
     logit_probs = pred[..., :nr_mix]
     mean = torch.tanh(pred[..., nr_mix : 2 * nr_mix])
-    log_scales = torch.clamp(pred[..., 2 * nr_mix : 3 * nr_mix], min=log_scale_min)
+    log_scales = torch.clamp(pred[..., 2 * nr_mix : 3 * nr_mix], min=log_scale_min, max=3.0)
 
     # Repeat data with nr_mix channels
     data = data * torch.ones((1, 1, 1, nr_mix)).type_as(data)
@@ -51,7 +51,7 @@ def discretized_mix_logistic_loss(
 
     inner_inner_cond = (cdf_delta > 1e-5).float()
     inner_inner_out = inner_inner_cond * torch.log(
-        torch.clamp(cdf_delta, min=1e-12)
+        torch.clamp(cdf_delta, min=1e-8)
     ) + (1.0 - inner_inner_cond) * (
         log_pdf_mid - torch.log(torch.tensor((num_classes - 1) / 2))
     )
