@@ -39,7 +39,7 @@ def evaluate(config, ckpt):
     # Perform hyperparameter search as in MERT
     lrs = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2]
     batch_size = [64]
-    drop_outs = [0.25]
+    drop_outs = [0.2]
     l2s = [0]
 
     train_sizes = [-1]
@@ -76,7 +76,6 @@ def evaluate(config, ckpt):
                 model_param["dropout"] = setting[2]
                 model_param["l2"] = setting[3]
                 model_param["feature_loaded"] = datamodule.feature_loaded
-                model = task_config
                 model = task.prober(**model_param)
                 early_stop = EarlyStopping(
                     monitor=f"{task_name}_val_loss",

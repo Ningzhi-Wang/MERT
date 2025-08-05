@@ -28,7 +28,7 @@ def discretized_mix_logistic_loss(
     nr_mix = pred.shape[-1] // 3
     # unpack paramteres: distribution probability, mean, log scale
     logit_probs = pred[..., :nr_mix]
-    mean = torch.tanh(pred[..., nr_mix : 2 * nr_mix])
+    mean = pred[..., nr_mix : 2 * nr_mix]
     log_scales = torch.clamp(pred[..., 2 * nr_mix : 3 * nr_mix], min=log_scale_min, max=3.0)
 
     # Repeat data with nr_mix channels
