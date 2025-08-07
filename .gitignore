@@ -3,6 +3,7 @@
 
 # Data files
 data/
+locals/
 scripts/
 ./models/
 
