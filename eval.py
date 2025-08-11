@@ -79,8 +79,9 @@ def evaluate(config, ckpt):
                 model = task.prober(**model_param)
                 early_stop = EarlyStopping(
                     monitor=f"{task_name}_val_loss",
-                    patience=30,
+                    patience=20,
                     mode="max",
+                    verbose=True,
                 )
                 checkpoint_callback = ModelCheckpoint(
                     dirpath=log_path / task_name,
