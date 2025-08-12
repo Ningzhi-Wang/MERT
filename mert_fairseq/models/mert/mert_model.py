@@ -193,6 +193,9 @@ class MERTConfig(FairseqDataclass):
     mask_type: str = field(
         default="hubert", metadata={"help": "mask type [hubert/mae]"}
     )
+    mask_encode: bool = field(
+        default=False, metadata={"help": "whether to mask the encoded features"}
+    )
     mask_length: int = field(default=10, metadata={"help": "mask length"})
     mask_prob: float = field(
         default=0.65,
@@ -753,6 +756,7 @@ class MERTModel(BaseFairseqModel):
             self.post_proj_layer_norm = None
 
         self.mask_type = cfg.mask_type
+        self.mask_encode = cfg.mask_encode
         self.mask_prob = cfg.mask_prob
         self.mask_selection = cfg.mask_selection
         self.mask_other = cfg.mask_other
@@ -809,12 +813,14 @@ class MERTModel(BaseFairseqModel):
                 assert not cfg.layer_norm_first
 
             self.encoder = TransformerEncoder_extend(
-                cfg, skip_pos_conv=self.mask_type == "mae"
+                # cfg, skip_pos_conv=self.mask_type == "mae"
+                cfg, skip_pos_conv=True
             )
 
         else:
             self.encoder = TransformerEncoder(
-                cfg, skip_pos_conv=self.mask_type == "mae"
+                # cfg, skip_pos_conv=self.mask_type == "mae"
+                cfg, skip_pos_conv=True
             )
 
         if self.do_cnn_feat_stable_layernorm:
@@ -938,7 +944,9 @@ class MERTModel(BaseFairseqModel):
             # for param in self.feature_extractor.parameters():
             #     param.requires_grad = False
 
-        if self.mask_type == "mae":
+        self.enc_pos_conv = make_conv_pos(
+            cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
+        if self.mask_encode:
             # mae need extra embeddings for both encoder and decoder inputs
             # pos_emb = get_1d_sincos_pos_embed(
             #     # fixed time length for now, need to be changed later
@@ -946,8 +954,6 @@ class MERTModel(BaseFairseqModel):
             #     torch.arange(374),
             # )
             # self.register_buffer("pos_emb", pos_emb)
-            self.enc_pos_conv = make_conv_pos(
-                cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
             self.dec_pos_conv = make_conv_pos(
                 cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
 
@@ -1155,8 +1161,11 @@ class MERTModel(BaseFairseqModel):
             x[mask_channel_indices] = 0
         masked_indices = torch.logical_and(~padding_mask, mask_indices)
         nomasked_indices = torch.logical_and(~padding_mask, ~mask_indices)
+        if self.mask_encode:
+            padding_mask = torch.logical_or(padding_mask, masked_indices)
         # return x, mask_indices
-        return x, masked_indices, nomasked_indices, padding_mask
+        ids_restore = torch.nonzero(nomasked_indices)
+        return x, masked_indices, ids_restore, padding_mask
 
     def mae_masking(self, x, padding_mask, *args, **kwargs):
         """
@@ -1415,9 +1424,9 @@ class MERTModel(BaseFairseqModel):
         features = self.dropout_input(features)
         unmasked_features = self.dropout_features(unmasked_features)
 
-        if self.mask_type == "mae":
+        # if self.mask_type == "mae":
             # features = features + self.pos_emb[:features.shape[1], :]
-            features = features + self.enc_pos_conv(features.transpose(1, 2)).transpose(1, 2)
+        features = features + self.enc_pos_conv(features.transpose(1, 2)).transpose(1, 2)
 
         if mask:
             x, masked_indices, nomask_indices, masked_padding_mask = self.apply_mask(
@@ -1451,18 +1460,23 @@ class MERTModel(BaseFairseqModel):
                 "masked_indices": masked_indices,
                 "id_restore": nomask_indices,
             }
-
-        if self.mask_type == "mae":
-            masked_tokens = self.mask_emb.expand(
-                x.shape[0],
-                nomask_indices.shape[1] - x.shape[1],
-                -1,
-            )
-            x = torch.cat((x, masked_tokens), dim=1)
-            restore_indices = (
-                nomask_indices.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
-            )
-            x = torch.gather(x, dim=1, index=restore_indices)
+        
+        if self.mask_encode:
+            if self.mask_type == "mae":
+                # The mae mask returns a 2D tensor with each sample having the same number of masked tokens.
+                masked_tokens = self.mask_emb.expand(
+                    x.shape[0],
+                    nomask_indices.shape[1] - x.shape[1],
+                    -1,
+                )
+                x = torch.cat((x, masked_tokens), dim=1)
+                restore_indices = (
+                    nomask_indices.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
+                )
+                x = torch.gather(x, dim=1, index=restore_indices)
+            elif self.mask_type == "hubert":
+                # The hubert mask returns a 2D tensor with each sample having different number of masked tokens
+                x[masked_indices] = self.mask_emb 
             # x = x + self.pos_emb[:nomask_indices.shape[1], :]
             x = x + self.dec_pos_conv(x.transpose(1, 2)).transpose(1, 2)
             x = self.decoder(x)
