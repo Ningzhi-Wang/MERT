@@ -1264,6 +1264,8 @@ class MERTModel(BaseFairseqModel):
         mel_x = self.mel_extractor(x)
         # B, L, D
         patches = self.patch_embed(mel_x.unsqueeze(1))
+        patches.requires_grad = False
+        assert not torch.isinf(patches).any(), "INF in inputs!!!"
         return patches.permute(0, 2, 1)  # B, D, L
 
     def forward_features(self, source: torch.Tensor) -> torch.Tensor:
