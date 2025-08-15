@@ -1190,8 +1190,6 @@ class MERTModel(BaseFairseqModel):
 
         # keep the first subset
         ids_keep = ids_shuffle[:, :len_keep]
-        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-        masked_padding_mask = torch.gather(padding_mask, dim=1, index=ids_keep)
 
         # generate the binary mask: 0 is keep, 1 is remove
         mask = torch.ones([N, L], device=x.device)
@@ -1199,6 +1197,12 @@ class MERTModel(BaseFairseqModel):
         # unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
         masked_indices = torch.logical_and(~padding_mask, mask)
+        if self.mask_encode:
+            x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+            masked_padding_mask = torch.gather(padding_mask, dim=1, index=ids_keep)
+        else:
+            x_masked = x
+            masked_padding_mask = padding_mask
 
         return x_masked, masked_indices, ids_restore, masked_padding_mask 
 
@@ -1264,7 +1268,7 @@ class MERTModel(BaseFairseqModel):
         mel_x = self.mel_extractor(x)
         # B, L, D
         patches = self.patch_embed(mel_x.unsqueeze(1))
-        patches.requires_grad = False
+        patches = patches.detach()
         assert not torch.isinf(patches).any(), "INF in inputs!!!"
         return patches.permute(0, 2, 1)  # B, D, L
 
