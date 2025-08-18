@@ -97,6 +97,12 @@ def get_scaler(adaptive: bool = True, **kwargs) -> Scaler:
         scaler.register_forward_pre_hook(adaptive_update_hook)
     return scaler
 
+def get_individual_scaler(x):
+    x_min = torch.amin(x, dim=(-1, -2))
+    x_max = torch.amax(x, dim=(-1, -2))
+    diff = x_max - x_min
+    return (x - x_min) / diff * 2 - 1
+
 
 def logistic_dist(a, b):
     base_distribution = dist.Uniform(0, 1)
