@@ -955,14 +955,14 @@ class MERTModel(BaseFairseqModel):
         # if self.mask_encode:
         if self.decoder_type != "none":
             # mae need extra embeddings for both encoder and decoder inputs
-            # pos_emb = get_1d_sincos_pos_embed(
-            #     # fixed time length for now, need to be changed later
-            #     cfg.encoder_embed_dim,
-            #     torch.arange(374),
-            # )
-            # self.register_buffer("pos_emb", pos_emb)
-            self.dec_pos_conv = make_conv_pos(
-                cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
+            pos_emb = get_1d_sincos_pos_embed(
+                # fixed time length for now, need to be changed later
+                cfg.encoder_embed_dim,
+                torch.arange(374),
+            )
+            self.register_buffer("pos_emb", pos_emb)
+            # self.dec_pos_conv = make_conv_pos(
+            #     cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
 
             # MAE decoder
             if self.decoder_type == 'mae':
@@ -972,6 +972,12 @@ class MERTModel(BaseFairseqModel):
                     )
                 for _ in range(8)] 
                 self.decoder = nn.Sequential(*decoder_blocks)
+            elif self.decoder_type == 'wav2vec':
+                decoder_cfg = cfg.copy()
+                decoder_cfg.encoder_layers = 4
+                self.decoder = TransformerEncoder(
+                    decoder_cfg, skip_pos_conv=True
+                )
             else:
                 raise NotImplementedError("Decoder not implemented yet!")
             self.decoder_layer_norm = LayerNorm(
@@ -1487,27 +1493,28 @@ class MERTModel(BaseFairseqModel):
         # if self.mask_encode:
         # Always adding extra decoding block for test.
         if self.decoder_type != 'none':
-            # The following are not necessary for now as masked tokens 
-            # has not been removed before encoding yet.
-            # if self.mask_type == "mae":
-            #     # The mae mask returns a 2D tensor with each sample having the same number of masked tokens.
-            #     masked_tokens = self.mask_emb.expand(
-            #         x.shape[0],
-            #         nomask_indices.shape[1] - x.shape[1],
-            #         -1,
-            #     )
-            #     x = torch.cat((x, masked_tokens), dim=1)
-            #     restore_indices = (
-            #         nomask_indices.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
-            #     )
-            #     x = torch.gather(x, dim=1, index=restore_indices)
-            # elif self.mask_type == "hubert":
-            #     # The hubert mask returns a 2D tensor with each sample having different number of masked tokens
-            #     x[masked_indices] = self.mask_emb 
-            # x = x + self.pos_emb[:nomask_indices.shape[1], :]
-            x = x + self.dec_pos_conv(x.transpose(1, 2)).transpose(1, 2)
-            x = self.decoder(x)
+            if self.mask_encode:
+                if self.mask_type == "mae":
+                    # The mae mask returns a 2D tensor with each sample having the same number of masked tokens.
+                    masked_tokens = self.mask_emb.expand(
+                        x.shape[0],
+                        nomask_indices.shape[1] - x.shape[1],
+                        -1,
+                    )
+                    x = torch.cat((x, masked_tokens), dim=1)
+                    restore_indices = (
+                        nomask_indices.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
+                    )
+                    x = torch.gather(x, dim=1, index=restore_indices)
+                elif self.mask_type == "hubert":
+                    # The hubert mask returns a 2D tensor with each sample having different number of masked tokens
+                    x[masked_indices] = self.mask_emb 
+            # use fixed positional embedding for decoding
+            x = x + self.pos_emb[:nomask_indices.shape[1], :]
+            # x = x + self.dec_pos_conv(x.transpose(1, 2)).transpose(1, 2)
+            x, _ = self.decoder(x, padding_mask=masked_padding_mask)
             x = self.decoder_layer_norm(x)
+            # x = x
 
         def compute_pred(proj_x, target, label_embs, logit_temp=None):
             # skip the codebook that is not selected
