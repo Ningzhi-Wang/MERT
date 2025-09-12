@@ -952,7 +952,6 @@ class MERTModel(BaseFairseqModel):
 
         self.enc_pos_conv = make_conv_pos(
             cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
-        # if self.mask_encode:
         if self.decoder_type != "none":
             # mae need extra embeddings for both encoder and decoder inputs
             pos_emb = get_1d_sincos_pos_embed(
@@ -1510,7 +1509,7 @@ class MERTModel(BaseFairseqModel):
                     # The hubert mask returns a 2D tensor with each sample having different number of masked tokens
                     x[masked_indices] = self.mask_emb 
             # use fixed positional embedding for decoding
-            x = x + self.pos_emb[:nomask_indices.shape[1], :]
+            x = x + self.pos_emb[:masked_indices.shape[1], :]
             # x = x + self.dec_pos_conv(x.transpose(1, 2)).transpose(1, 2)
             x, _ = self.decoder(x, padding_mask=masked_padding_mask)
             x = self.decoder_layer_norm(x)
@@ -1643,11 +1642,13 @@ class MERTModel(BaseFairseqModel):
                 else "masked_transformer_output"
             )
             cqt_pred_m = self.encoder_cqt_model(
-                x[masked_indices], forward_type=cqt_forward_type
+                # x[masked_indices], forward_type=cqt_forward_type
+                x, forward_type=cqt_forward_type
             )
             # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape)
             cqt_loss_m = self.encoder_cqt_model.criterion(
-                cqt_pred_m, cqt_targets[masked_indices]
+                # cqt_pred_m, cqt_targets[masked_indices]
+                cqt_pred_m, cqt_targets
             )
             result["cqt_pred_m"] = cqt_loss_m
 
