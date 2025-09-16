@@ -141,5 +141,7 @@ def get_1d_sincos_pos_embed(embed_dim, pos):
     emb_sin = torch.sin(out) # (M, D/2)
     emb_cos = torch.cos(out) # (M, D/2)
 
-    emb = torch.concatenate([emb_sin, emb_cos], dim=1)  # (M, D)
+    emb = torch.zeros(len(pos), len(omega) * 2, device=out.device, dtype=out.dtype)  # (M, D)
+    emb[:, 0::2] = emb_sin
+    emb[:, 1::2] = emb_cos
     return emb
