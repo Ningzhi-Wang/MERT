@@ -602,11 +602,12 @@ class model_cqt_pred(torch.nn.Module):
                 # nn.Tanh()
                 # LayerNorm(input_dim, elementwise_affine=False)
             )
-            self.target_scaler = get_individual_scaler
+            # self.target_scaler = get_individual_scaler
             # self.target_scaler = get_scaler(init_min=-1e-4, init_max=45)
-            self.criterion = lambda p, d: discretized_mix_logistic_loss(
+            # Apply no normalization for continuous logisitc loss
+            self.criterion = lambda p, d: mix_logistic_loss(
                 p,
-                self.target_scaler(d.unsqueeze(1)),
+                d.unsqueeze(1),
             )
             self.n_bins = n_bins
         else:
