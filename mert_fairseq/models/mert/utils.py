@@ -145,3 +145,20 @@ def get_1d_sincos_pos_embed(embed_dim, pos):
     emb[:, 0::2] = emb_sin
     emb[:, 1::2] = emb_cos
     return emb
+
+
+def get_restore_indices(mask):
+    """
+    mask: [B, T], 0 is keep, 1 is remove
+    return:
+        ids_restore: [B, L], the indices to restore original order
+    """
+    B, T = mask.shape
+    all_indices = torch.arange(T, device=mask.device).expand(B, T)
+    unmasked = all_indices[~mask].view(B, -1)
+    masked = all_indices[mask].view(B, -1)
+    perm = torch.cat([unmasked, masked], dim=1)
+    ids_restore = torch.empty_like(perm)
+    batch_ids = torch.arange(B).unsqueeze(1).expand_as(perm)
+    ids_restore[batch_ids, perm] = all_indices
+    return ids_restore

@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from .utils import get_1d_sincos_pos_embed, mix_logistic_loss
+from .utils import get_1d_sincos_pos_embed, mix_logistic_loss, get_restore_indices
 
 ################################################
 # Unit tests for Positoional Embedding
@@ -88,3 +88,50 @@ def test_gradient_backprop():
     loss.backward()
     assert pred.grad is not None
     assert torch.isfinite(pred.grad).all()
+
+
+################################################
+# Unit tests for Restore Indices
+################################################
+@pytest.mark.parametrize("mask", [
+    # Single batch, some masked
+    torch.tensor([[0, 1, 0, 1]], dtype=torch.bool),
+
+    # Single batch, all unmasked
+    torch.tensor([[0, 0, 0, 0]], dtype=torch.bool),
+
+    # Single batch, all masked
+    torch.tensor([[1, 1, 1, 1]], dtype=torch.bool),
+
+    # Multi-batch with different patterns
+    torch.tensor([
+        [0, 1, 0, 1],
+        [1, 0, 0, 1],
+    ], dtype=torch.bool),
+
+    # Larger T
+    torch.tensor([
+        [0, 1, 1, 0, 1],
+        [1, 1, 0, 0, 1],
+    ], dtype=torch.bool),
+])
+def test_restore_indices(mask):
+    B, T = mask.shape
+    device = mask.device
+
+    ids_restore = get_restore_indices(mask)
+
+    # (1) shape check
+    assert ids_restore.shape == (B, T)
+
+    # (2) Permute [unmasked | masked]
+    all_idx = torch.arange(T, device=device).expand(B, T)
+    unmasked = all_idx[~mask].view(B, -1)
+    masked = all_idx[mask].view(B, -1)
+    perm = torch.cat([unmasked, masked], dim=1)
+
+    # (3) Apply restore to perm → should recover original indices
+    restored = torch.gather(perm, dim=1, index=ids_restore)
+
+    for b in range(B):
+        assert torch.equal(restored[b], all_idx[b]), f"Batch {restored[b], ids_restore[b]} failed"
