@@ -51,6 +51,7 @@ from .utils import (
     mix_logistic_loss,
     get_1d_sincos_pos_embed,
     get_individual_scaler,
+    get_restore_indices,
 )
 
 logger = logging.getLogger(__name__)
@@ -1127,6 +1128,7 @@ class MERTModel(BaseFairseqModel):
                 min_masks=2,
                 no_overlap=self.no_mask_overlap,
                 min_space=self.mask_min_space,
+                require_same_masks=True,
             )
             if self.mask_replace > 0:
                 mask_emb_indices, replace_indices, replace_target_indices = (
@@ -1175,13 +1177,12 @@ class MERTModel(BaseFairseqModel):
                 .expand(-1, T, -1)
             )
             x[mask_channel_indices] = 0
-        masked_indices = torch.logical_and(~padding_mask, mask_indices)
-        nomasked_indices = torch.logical_and(~padding_mask, ~mask_indices)
+        ids_restore = get_restore_indices(mask_indices)
+        # masked_indices = torch.logical_and(~padding_mask, mask_indices)
         if self.mask_encode:
-            padding_mask = torch.logical_or(padding_mask, masked_indices)
-        # return x, mask_indices
-        ids_restore = torch.nonzero(nomasked_indices)
-        return x, masked_indices, ids_restore, padding_mask
+            x = x[~mask_indices].view(B, -1, C)
+            padding_mask = padding_mask[~mask_indices].view(B, -1)
+        return x, mask_indices, ids_restore, padding_mask
 
     def mae_masking(self, x, padding_mask, *args, **kwargs):
         """
@@ -1193,10 +1194,10 @@ class MERTModel(BaseFairseqModel):
             masked_indices: binary mask, 0 is keep, 1 is remove, [N, L]
             restore_indices: Indices to restore shuffled tokens to original order, [N, L]
         """
-        N, L, D = x.shape  # batch, length, dim
-        len_keep = int(L * (1 - self.mask_prob))
+        B, T, C = x.shape  # batch, length, dim
+        len_keep = int(T * (1 - self.mask_prob))
 
-        noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+        noise = torch.rand(B, T, device=x.device)  # noise in [0, 1]
 
         # sort noise for each sample
         ids_shuffle = torch.argsort(
@@ -1208,20 +1209,19 @@ class MERTModel(BaseFairseqModel):
         ids_keep = ids_shuffle[:, :len_keep]
 
         # generate the binary mask: 0 is keep, 1 is remove
-        mask = torch.ones([N, L], device=x.device)
+        mask = torch.ones([B, T], device=x.device)
         mask[:, :len_keep] = 0
         # unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
-        masked_indices = torch.logical_and(~padding_mask, mask)
-        # if self.mask_encode:
-        #     x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-        #     masked_padding_mask = torch.gather(padding_mask, dim=1, index=ids_keep)
-        # else:
-        x_masked = x
-        x_masked[masked_indices] = self.mask_emb
-        masked_padding_mask = padding_mask
+        if self.mask_encode:
+            x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, C))
+            masked_padding_mask = torch.gather(padding_mask, dim=1, index=ids_keep)
+        else:
+            x_masked = x
+            x_masked[mask] = self.mask_emb
+            masked_padding_mask = padding_mask[mask].view(B, -1)
 
-        return x_masked, masked_indices, ids_restore, masked_padding_mask 
+        return x_masked, mask, ids_restore, masked_padding_mask 
 
     def compute_nce(self, x, pos, negs):
         neg_is_pos = (pos == negs).all(-1)
@@ -1451,22 +1451,17 @@ class MERTModel(BaseFairseqModel):
             # features = features + self.pos_emb[:features.shape[1], :]
 
         if mask:
-            x, masked_indices, nomask_indices, masked_padding_mask = self.apply_mask(
+            x, masked_indices, ids_restore, masked_padding_mask = self.apply_mask(
                 features, self.mask_type, padding_mask, target_list
             )
             # masked_padding_mask = padding_mask if self.mask_type != "mae" else padding_mask[masked_indices]
         else:
             x = features
             masked_indices = None
-            nomask_indices = None
+            ids_restore = None
             masked_padding_mask = padding_mask
 
         x = x + self.enc_pos_conv(x.transpose(1, 2)).transpose(1, 2)
-        # Remove masked tokens after masking and positional encoding 
-        # Assume the number of masked token is the same in each sample.
-        if self.mask_encode:
-            assert len(torch.unique(masked_indices.sum(dim=-1))) == 1, f"The number of masked tokens is different in each sample: {masked_indices.sum(dim=-1)}"
-            x = x[masked_indices].view(x.shape[0], -1, x.shape[-1])
 
         # feature: (B, T, D), float
         # target: (B, T), long
@@ -1487,34 +1482,25 @@ class MERTModel(BaseFairseqModel):
                 "features": features,
                 "layer_results": layer_results,
                 "masked_indices": masked_indices,
-                "id_restore": nomask_indices,
+                "id_restore": ids_restore,
             }
         
-        # if self.mask_encode:
-        # Always adding extra decoding block for test.
         if self.decoder_type != 'none':
             if self.mask_encode:
-                if self.mask_type == "mae":
-                    # The mae mask returns a 2D tensor with each sample having the same number of masked tokens.
-                    masked_tokens = self.mask_emb.expand(
-                        x.shape[0],
-                        nomask_indices.shape[1] - x.shape[1],
-                        -1,
-                    )
-                    x = torch.cat((x, masked_tokens), dim=1)
-                    restore_indices = (
-                        nomask_indices.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
-                    )
-                    x = torch.gather(x, dim=1, index=restore_indices)
-                elif self.mask_type == "hubert":
-                    # The hubert mask returns a 2D tensor with each sample having different number of masked tokens
-                    x[masked_indices] = self.mask_emb 
+                masked_tokens = self.mask_emb.expand(
+                    x.shape[0],
+                    ids_restore.shape[1] - x.shape[1],
+                    -1,
+                )
+                x = torch.cat((x, masked_tokens), dim=1)
+                restore_indices = (
+                    ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
+                )
+                x = torch.gather(x, dim=1, index=restore_indices)
             # use fixed positional embedding for decoding
-            x = x + self.pos_emb[:masked_indices.shape[1], :]
-            # x = x + self.dec_pos_conv(x.transpose(1, 2)).transpose(1, 2)
-            x, _ = self.decoder(x, padding_mask=masked_padding_mask)
+            x = x + self.pos_emb
+            x, _ = self.decoder(x, padding_mask=padding_mask)
             x = self.decoder_layer_norm(x)
-            # x = x
 
         def compute_pred(proj_x, target, label_embs, logit_temp=None):
             # skip the codebook that is not selected
@@ -1595,14 +1581,14 @@ class MERTModel(BaseFairseqModel):
 
         if not self.skip_nomask and self.mask_type == "hubert":
             # nomask_indices = torch.logical_and(~padding_mask, ~mask_indices)
-            proj_x_u = self.final_proj(x[nomask_indices])
+            proj_x_u = self.final_proj(x[ids_restore])
             if self.untie_final_proj:
                 proj_x_u_list = proj_x_u.chunk(len(target_list), dim=-1)
             else:
                 proj_x_u_list = [proj_x_u for _ in range(len(target_list))]
 
             logit_u_list = [
-                compute_pred(proj_x_u, t[nomask_indices], label_embs_list[i])
+                compute_pred(proj_x_u, t[ids_restore], label_embs_list[i])
                 for i, (proj_x_u, t) in enumerate(zip(proj_x_u_list, target_list))
             ]
         else:
