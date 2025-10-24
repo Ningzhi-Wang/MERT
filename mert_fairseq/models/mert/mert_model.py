@@ -821,14 +821,12 @@ class MERTModel(BaseFairseqModel):
                 assert not cfg.layer_norm_first
 
             self.encoder = TransformerEncoder_extend(
-                # cfg, skip_pos_conv=self.mask_type == "mae"
-                cfg, skip_pos_conv=True
+                cfg
             )
 
         else:
             self.encoder = TransformerEncoder(
-                # cfg, skip_pos_conv=self.mask_type == "mae"
-                cfg, skip_pos_conv=True
+                cfg
             )
 
         if self.do_cnn_feat_stable_layernorm:
@@ -952,18 +950,16 @@ class MERTModel(BaseFairseqModel):
             # for param in self.feature_extractor.parameters():
             #     param.requires_grad = False
 
-        self.enc_pos_conv = make_conv_pos(
-            cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
         if self.decoder_type != "none":
             # mae need extra embeddings for both encoder and decoder inputs
-            pos_emb = get_1d_sincos_pos_embed(
-                # fixed time length for now, need to be changed later
-                cfg.encoder_embed_dim,
-                torch.arange(374),
-            )
-            self.register_buffer("pos_emb", pos_emb)
-            # self.dec_pos_conv = make_conv_pos(
-            #     cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
+            # pos_emb = get_1d_sincos_pos_embed(
+            #     # fixed time length for now, need to be changed later
+            #     cfg.encoder_embed_dim,
+            #     torch.arange(374),
+            # )
+            # self.register_buffer("pos_emb", pos_emb)
+            self.dec_pos_conv = make_conv_pos(
+                cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
 
             # MAE decoder
             if self.decoder_type == 'mae':
@@ -981,9 +977,9 @@ class MERTModel(BaseFairseqModel):
                 )
             else:
                 raise NotImplementedError("Decoder not implemented yet!")
-            self.decoder_layer_norm = LayerNorm(
-                cfg.encoder_embed_dim, elementwise_affine=False
-            )
+            # self.decoder_layer_norm = LayerNorm(
+            #     cfg.encoder_embed_dim, elementwise_affine=False
+            # )
 
     def inbatch_noise_augment(
         self,
@@ -1447,9 +1443,6 @@ class MERTModel(BaseFairseqModel):
         features = self.dropout_input(features)
         unmasked_features = self.dropout_features(unmasked_features)
 
-        # if self.mask_type == "mae":
-            # features = features + self.pos_emb[:features.shape[1], :]
-
         if mask:
             x, masked_indices, ids_restore, masked_padding_mask = self.apply_mask(
                 features, self.mask_type, padding_mask, target_list
@@ -1461,7 +1454,6 @@ class MERTModel(BaseFairseqModel):
             ids_restore = None
             masked_padding_mask = padding_mask
 
-        x = x + self.enc_pos_conv(x.transpose(1, 2)).transpose(1, 2)
 
         # feature: (B, T, D), float
         # target: (B, T), long
@@ -1498,9 +1490,10 @@ class MERTModel(BaseFairseqModel):
                 )
                 x = torch.gather(x, dim=1, index=restore_indices)
             # use fixed positional embedding for decoding
-            x = x + self.pos_emb
+            # x = x + self.pos_emb[:x.shape[1], :]
+            x = x + self.dec_pos_conv(x.transpose(1, 2)).transpose(1, 2)
             x, _ = self.decoder(x, padding_mask=padding_mask)
-            x = self.decoder_layer_norm(x)
+            # x = self.decoder_layer_norm(x)
 
         def compute_pred(proj_x, target, label_embs, logit_temp=None):
             # skip the codebook that is not selected
@@ -1629,13 +1622,13 @@ class MERTModel(BaseFairseqModel):
                 else "masked_transformer_output"
             )
             cqt_pred_m = self.encoder_cqt_model(
-                # x[masked_indices], forward_type=cqt_forward_type
-                x, forward_type=cqt_forward_type
+                x[masked_indices], forward_type=cqt_forward_type
+                # x, forward_type=cqt_forward_type
             )
             # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape)
             cqt_loss_m = self.encoder_cqt_model.criterion(
-                # cqt_pred_m, cqt_targets[masked_indices]
-                cqt_pred_m, cqt_targets
+                cqt_pred_m, cqt_targets[masked_indices]
+                # cqt_pred_m, cqt_targets
             )
             result["cqt_pred_m"] = cqt_loss_m
 
