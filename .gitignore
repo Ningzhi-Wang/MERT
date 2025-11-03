@@ -2,10 +2,10 @@
 .idea/
 
 # Data files
-data/
-locals/
-scripts/
-./models/
+/data/
+/local/
+/scripts/
+/models/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
