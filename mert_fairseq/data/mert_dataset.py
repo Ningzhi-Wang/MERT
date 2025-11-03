@@ -28,6 +28,8 @@ import tqdm
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+from .utils import get_audio_file
+
 class model_cqt_pred(torch.nn.Module):
     def __init__(self, n_bins=84, sr=16000, freq=50):
         super().__init__()
@@ -307,7 +309,8 @@ class MERTDataset(FairseqDataset):
         _path, slice_ptr = parse_path(wav_path)
         # original way
         if len(slice_ptr) == 0:
-            wav, cur_sample_rate = sf.read(_path)
+            wav, cur_sample_rate = get_audio_file(_path)
+            # wav, cur_sample_rate = sf.read(_path)
         else:
             assert _path.endswith(".zip")
             data = read_from_stored_zip(_path, slice_ptr[0], slice_ptr[1])
