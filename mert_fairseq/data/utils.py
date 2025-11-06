@@ -6,7 +6,7 @@ import numpy as np
 import soundfile as sf
 
 def get_audio_file(file_path: str) -> bytes:
-    if os.get_env("S3_DATASET", False):
+    if os.get_env("DATASET_LOCATION", "LOCAL") == "S3":
         wav, sr = read_from_s3(file_path)
     else:
         wav, sr = sf.read(file_path)
