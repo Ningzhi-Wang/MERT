@@ -692,7 +692,6 @@ class MERTModel(BaseFairseqModel):
         feature_enc_layers = eval(cfg.conv_feature_layers)  # noqa
         # ? why not just save the whole cfg?? maybe it's because the datatype inside the cfg cant'be changed? since there's eval()
         self.cfg = cfg
-        self.embed = feature_enc_layers[-1][0]
 
         if self.cfg.feature_extractor_cqt:
             self.feature_extractor_cqt = nnAudioFeatures.cqt.CQT(
@@ -742,6 +741,7 @@ class MERTModel(BaseFairseqModel):
                 "Only w2v_conv and spec_mlp are supported for now"
             )
 
+        self.embed = feature_enc_layers[-1][0]
         if self.cfg.feature_extractor_cqt:
             self.embed = feature_enc_layers[-1][0] + cfg.feature_extractor_cqt_bins
 
@@ -793,6 +793,7 @@ class MERTModel(BaseFairseqModel):
 
         self.learnable_temp = cfg.learnable_temp
 
+
         self.wav_normalize = cfg.wav_normalize
 
         if not self.learnable_temp:
@@ -820,14 +821,10 @@ class MERTModel(BaseFairseqModel):
             if cfg.deepnorm:
                 assert not cfg.layer_norm_first
 
-            self.encoder = TransformerEncoder_extend(
-                cfg
-            )
+            self.encoder = TransformerEncoder_extend(cfg)
 
         else:
-            self.encoder = TransformerEncoder(
-                cfg
-            )
+            self.encoder = TransformerEncoder(cfg)
 
         if self.do_cnn_feat_stable_layernorm:
             self.layer_norm = LayerNorm(self.embed, elementwise_affine=False)
@@ -931,7 +928,6 @@ class MERTModel(BaseFairseqModel):
                         if pattern in k:
                             toloads.append(k)
                 return toloads
-
             modules_to_load = filter_keys(load_patterns, pretrained_dict.keys())
             logger.info(f"found modules to load: {modules_to_load}")
             pretrained_dict = {
@@ -952,14 +948,14 @@ class MERTModel(BaseFairseqModel):
 
         if self.decoder_type != "none":
             # mae need extra embeddings for both encoder and decoder inputs
-            # pos_emb = get_1d_sincos_pos_embed(
-            #     # fixed time length for now, need to be changed later
-            #     cfg.encoder_embed_dim,
-            #     torch.arange(374),
-            # )
-            # self.register_buffer("pos_emb", pos_emb)
-            self.dec_pos_conv = make_conv_pos(
-                cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
+            pos_emb = get_1d_sincos_pos_embed(
+                # fixed time length for now, need to be changed later
+                cfg.encoder_embed_dim,
+                torch.arange(374),
+            )
+            self.register_buffer("pos_emb", pos_emb)
+            # self.dec_pos_conv = make_conv_pos(
+            #     cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
 
             # MAE decoder
             if self.decoder_type == 'mae':
@@ -971,7 +967,7 @@ class MERTModel(BaseFairseqModel):
                 self.decoder = nn.Sequential(*decoder_blocks)
             elif self.decoder_type == 'wav2vec':
                 decoder_cfg = cfg.copy()
-                decoder_cfg.encoder_layers = 4
+                decoder_cfg.encoder_layers = 2
                 self.decoder = TransformerEncoder(
                     decoder_cfg, skip_pos_conv=True
                 )
@@ -1490,8 +1486,8 @@ class MERTModel(BaseFairseqModel):
                 )
                 x = torch.gather(x, dim=1, index=restore_indices)
             # use fixed positional embedding for decoding
-            # x = x + self.pos_emb[:x.shape[1], :]
-            x = x + self.dec_pos_conv(x.transpose(1, 2)).transpose(1, 2)
+            x = x + self.pos_emb[:x.shape[1], :]
+            # x = x + self.dec_pos_conv(x.transpose(1, 2)).transpose(1, 2)
             x, _ = self.decoder(x, padding_mask=padding_mask)
             # x = self.decoder_layer_norm(x)
 
