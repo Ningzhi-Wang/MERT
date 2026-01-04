@@ -948,12 +948,12 @@ class MERTModel(BaseFairseqModel):
 
         if self.decoder_type != "none":
             # mae need extra embeddings for both encoder and decoder inputs
-            pos_emb = get_1d_sincos_pos_embed(
-                # fixed time length for now, need to be changed later
-                cfg.encoder_embed_dim,
-                torch.arange(374),
-            )
-            self.register_buffer("pos_emb", pos_emb)
+            # pos_emb = get_1d_sincos_pos_embed(
+            #     # fixed time length for now, need to be changed later
+            #     cfg.encoder_embed_dim,
+            #     torch.arange(374),
+            # )
+            # self.register_buffer("pos_emb", pos_emb)
             # self.dec_pos_conv = make_conv_pos(
             #     cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
 
@@ -967,9 +967,9 @@ class MERTModel(BaseFairseqModel):
                 self.decoder = nn.Sequential(*decoder_blocks)
             elif self.decoder_type == 'wav2vec':
                 decoder_cfg = cfg.copy()
-                decoder_cfg.encoder_layers = 2
+                decoder_cfg.encoder_layers = 4
                 self.decoder = TransformerEncoder(
-                    decoder_cfg, skip_pos_conv=True
+                    decoder_cfg
                 )
             else:
                 raise NotImplementedError("Decoder not implemented yet!")
@@ -1486,7 +1486,7 @@ class MERTModel(BaseFairseqModel):
                 )
                 x = torch.gather(x, dim=1, index=restore_indices)
             # use fixed positional embedding for decoding
-            x = x + self.pos_emb[:x.shape[1], :]
+            # x = x + self.pos_emb[:x.shape[1], :]
             # x = x + self.dec_pos_conv(x.transpose(1, 2)).transpose(1, 2)
             x, _ = self.decoder(x, padding_mask=padding_mask)
             # x = self.decoder_layer_norm(x)
