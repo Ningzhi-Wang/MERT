@@ -85,6 +85,15 @@ class MERTConfig(FairseqDataclass):
     encoder_attention_heads: int = field(
         default=12, metadata={"help": "num encoder attention heads"}
     )
+    decoder_layers: int = field(
+        default=4, metadata={"help": "num layers in the decoder transformer"}
+    )
+    decoder_embed_dim: int = field(
+        default=384, metadata={"help": "decoder embedding dimension"}
+    )
+    decoder_ffn_embed_dim: int = field(
+        default=1536, metadata={"help": "decoder embedding dimension for FFN"}
+    )
     activation_fn: ChoiceEnum(utils.get_available_activation_fns()) = field(
         default="gelu", metadata={"help": "activation function to use"}
     )
@@ -692,6 +701,7 @@ class MERTModel(BaseFairseqModel):
         feature_enc_layers = eval(cfg.conv_feature_layers)  # noqa
         # ? why not just save the whole cfg?? maybe it's because the datatype inside the cfg cant'be changed? since there's eval()
         self.cfg = cfg
+        self.embed = feature_enc_layers[-1][0]
 
         if self.cfg.feature_extractor_cqt:
             self.feature_extractor_cqt = nnAudioFeatures.cqt.CQT(
@@ -741,7 +751,6 @@ class MERTModel(BaseFairseqModel):
                 "Only w2v_conv and spec_mlp are supported for now"
             )
 
-        self.embed = feature_enc_layers[-1][0]
         if self.cfg.feature_extractor_cqt:
             self.embed = feature_enc_layers[-1][0] + cfg.feature_extractor_cqt_bins
 
@@ -809,11 +818,14 @@ class MERTModel(BaseFairseqModel):
 
         self.chunk_nce_cal = cfg.chunk_nce_cal
 
-        final_dim = cfg.final_dim if cfg.final_dim > 0 else cfg.encoder_embed_dim
-
+        last_feature_dim = cfg.decoder_embed_dim if self.mask_encode else cfg.encoder_embed_dim
+        final_dim = cfg.final_dim if cfg.final_dim > 0 else last_feature_dim
         self.mask_emb = nn.Parameter(
-            torch.FloatTensor(cfg.encoder_embed_dim).uniform_()
+            torch.FloatTensor(last_feature_dim).uniform_()
         )
+
+        encoder_cfg = cfg.copy()
+        encoder_cfg.checkpoint_activations = True
 
         if cfg.attention_relax > 0 or cfg.deepnorm or cfg.subln:
             if cfg.subln:
@@ -821,10 +833,10 @@ class MERTModel(BaseFairseqModel):
             if cfg.deepnorm:
                 assert not cfg.layer_norm_first
 
-            self.encoder = TransformerEncoder_extend(cfg)
+            self.encoder = TransformerEncoder_extend(encoder_cfg)
 
         else:
-            self.encoder = TransformerEncoder(cfg)
+            self.encoder = TransformerEncoder(encoder_cfg)
 
         if self.do_cnn_feat_stable_layernorm:
             self.layer_norm = LayerNorm(self.embed, elementwise_affine=False)
@@ -844,21 +856,21 @@ class MERTModel(BaseFairseqModel):
         if self.random_codebook <= 0:
             if self.untie_final_proj:
                 self.final_proj = nn.Linear(
-                    cfg.encoder_embed_dim, final_dim * len(dictionaries)
+                    last_feature_dim, final_dim * len(dictionaries)
                 )
             else:
-                self.final_proj = nn.Linear(cfg.encoder_embed_dim, final_dim)
+                self.final_proj = nn.Linear(last_feature_dim, final_dim)
         else:
             assert self.random_codebook <= len(dictionaries)
             if self.untie_final_proj:
                 self.final_projs = nn.ModuleList(
                     [
-                        nn.Linear(cfg.encoder_embed_dim, final_dim)
+                        nn.Linear(last_feature_dim, final_dim)
                         for _ in range(len(dictionaries))
                     ]
                 )
             else:
-                self.final_proj = nn.Linear(cfg.encoder_embed_dim, final_dim)
+                self.final_proj = nn.Linear(last_feature_dim, final_dim)
 
         # modules below are not needed during fine-tuning
         if any([d is None for d in dictionaries]):
@@ -875,7 +887,7 @@ class MERTModel(BaseFairseqModel):
                 "train the model with extra task: reconstruct cqt from transformer output"
             )
             self.encoder_cqt_model = model_cqt_pred(
-                input_dim=cfg.encoder_embed_dim,
+                input_dim=last_feature_dim,
                 n_bins=cfg.audio_cqt_bins,
                 sr=int(task_cfg.sample_rate),
                 freq=int(cfg.label_rate),
@@ -886,7 +898,7 @@ class MERTModel(BaseFairseqModel):
                 "train the model with extra task: reconstruct mel from transformer output"
             )
             self.encoder_mel_model = model_mel_pred(
-                input_dim=cfg.encoder_embed_dim,
+                input_dim=last_feature_dim,
                 n_bins=cfg.audio_mel_bins,
                 sr=int(task_cfg.sample_rate),
                 freq=int(cfg.label_rate),
@@ -947,27 +959,22 @@ class MERTModel(BaseFairseqModel):
             #     param.requires_grad = False
 
         if self.decoder_type != "none":
-            # mae need extra embeddings for both encoder and decoder inputs
-            # pos_emb = get_1d_sincos_pos_embed(
-            #     # fixed time length for now, need to be changed later
-            #     cfg.encoder_embed_dim,
-            #     torch.arange(374),
-            # )
-            # self.register_buffer("pos_emb", pos_emb)
-            # self.dec_pos_conv = make_conv_pos(
-            #     cfg.encoder_embed_dim, cfg.conv_pos, cfg.conv_pos_groups, False)
-
             # MAE decoder
+            self.decoder_proj = nn.Linear(
+                cfg.encoder_embed_dim, cfg.decoder_embed_dim, bias=True
+            )
             if self.decoder_type == 'mae':
                 decoder_blocks = [
                     Block(
-                        cfg.encoder_embed_dim, 8, 4.0, qkv_bias=True, norm_layer=LayerNorm
+                        cfg.decoder_embed_dim, cfg.decoder_layers, 4.0, qkv_bias=True, norm_layer=LayerNorm
                     )
                 for _ in range(8)] 
                 self.decoder = nn.Sequential(*decoder_blocks)
             elif self.decoder_type == 'wav2vec':
                 decoder_cfg = cfg.copy()
-                decoder_cfg.encoder_layers = 4
+                decoder_cfg.encoder_layers = cfg.decoder_layers
+                decoder_cfg.encoder_embed_dim = cfg.decoder_embed_dim
+                decoder_cfg.encoder_ffn_embed_dim = cfg.decoder_ffn_embed_dim
                 self.decoder = TransformerEncoder(
                     decoder_cfg
                 )
@@ -1140,13 +1147,14 @@ class MERTModel(BaseFairseqModel):
                 replace_target_indices = torch.from_numpy(replace_target_indices).to(
                     x.device
                 )  # tokens that are used to replace
-
-                x[mask_emb_indices] = self.mask_emb
-                x[replace_indices] = x[replace_target_indices]
+                if not self.mask_encode:
+                    x[mask_emb_indices] = self.mask_emb
+                    x[replace_indices] = x[replace_target_indices]
 
             else:
                 mask_indices = torch.from_numpy(mask_indices).to(x.device)
-                x[mask_indices] = self.mask_emb
+                if not self.mask_encode:
+                    x[mask_indices] = self.mask_emb
 
         else:
             mask_indices = None
@@ -1201,7 +1209,7 @@ class MERTModel(BaseFairseqModel):
         ids_keep = ids_shuffle[:, :len_keep]
 
         # generate the binary mask: 0 is keep, 1 is remove
-        mask = torch.ones([B, T], device=x.device)
+        mask = torch.ones([B, T], device=x.device).bool()
         mask[:, :len_keep] = 0
         # unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
@@ -1456,7 +1464,6 @@ class MERTModel(BaseFairseqModel):
         # x: (B, T, D), float
         # padding_mask: (B, T), bool
         # mask_indices: (B, T), bool
-
         x, layer_results = self.encoder(
             x,
             padding_mask=masked_padding_mask,
@@ -1472,8 +1479,10 @@ class MERTModel(BaseFairseqModel):
                 "masked_indices": masked_indices,
                 "id_restore": ids_restore,
             }
-        
+
         if self.decoder_type != 'none':
+            x = self.decoder_proj(x)
+
             if self.mask_encode:
                 masked_tokens = self.mask_emb.expand(
                     x.shape[0],
@@ -1485,11 +1494,7 @@ class MERTModel(BaseFairseqModel):
                     ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
                 )
                 x = torch.gather(x, dim=1, index=restore_indices)
-            # use fixed positional embedding for decoding
-            # x = x + self.pos_emb[:x.shape[1], :]
-            # x = x + self.dec_pos_conv(x.transpose(1, 2)).transpose(1, 2)
             x, _ = self.decoder(x, padding_mask=padding_mask)
-            # x = self.decoder_layer_norm(x)
 
         def compute_pred(proj_x, target, label_embs, logit_temp=None):
             # skip the codebook that is not selected
