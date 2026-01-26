@@ -2,6 +2,7 @@ import argparse
 import os
 import yaml
 import json
+import boto3
 import numpy as np
 import torch
 import pytorch_lightning as pl
@@ -18,12 +19,12 @@ from musiceval import tasks
 
 
 TASK_PATH = {
-    "MTT": "/data/scratch/acw713/datasets/mtt",
-    "GTZAN": "/data/scratch/acw713/datasets/gtzan",
-    "EMO": "/data/scratch/acw713/datasets/musicemo",
-    "Giantsteps": "/data/scratch/acw713/datasets/giantsteps",
-    "NSynthPitch": "/data/scratch/acw713/datasets/nsynth",
-    "NSynthTimbre": "/data/scratch/acw713/datasets/nsynth",
+    "MTT": "c4dm-datasets/MagnaTagATune/",
+    "GTZAN": "c4dm-datasets/gtzan/",
+    "EMO": "c4dm-datasets/emomuisc/",
+    "Giantsteps": "c4dm-datasets/Giantsteps/",
+    "NSynthPitch": "c4dm-datasets/NSynth/",
+    "NSynthTimbre": "c4dm-datasets/NSynth/",
     "MEDLEYDB": "/data/scratch/acw713/datasets/medleydb/V1/",
     "MTGGenre": "/data/scratch/acw713/datasets/mtg/",
     "MTGInstrument": "/data/scratch/acw713/datasets/mtg/",
@@ -35,6 +36,25 @@ TASK_PATH = {
 def evaluate(config, ckpt):
     assert ckpt is not None, "Checkpoint must be provided for evaluation"
     task_names = config["task_names"]
+
+    # Download checkpoint from S3 if not present locally
+    save_dir  = config['trainer']['path']
+    if not os.path.isfile(ckpt):
+        os.makedirs(save_dir, exist_ok=True)
+        aws_key = os.environ.get("AWS_ACCESS_KEY_C4DM02")
+        aws_secret = os.environ.get("AWS_SECRET_KEY_C4DM02")
+        s3 = boto3.client(
+            "s3",
+            endpoint_url="https://ceph-private-object-rgw.comp-research.qmul.ac.uk",
+            aws_access_key_id=aws_key,
+            aws_secret_access_key=aws_secret,
+        )
+        s3.download_file(
+            Bucket="c4dm-02",
+            Key=ckpt,
+            Filename=os.path.join(save_dir, "checkpoint.ckpt"),
+        )
+        ckpt = os.path.join(save_dir, "checkpoint.ckpt")
 
     # Perform hyperparameter search as in MERT
     lrs = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2]
@@ -115,12 +135,27 @@ def evaluate(config, ckpt):
                 results[
                     f"lr:{setting[0]}-batch:{setting[1]}-drop:{setting[2]}-l2:{setting[3]}"
                 ] = metric
-            with open(
-                Path(root_path)
-                / f"{task_name}_probing_results_size{train_size}.json",
-                "w",
-            ) as f:
-                json.dump(results, f, indent=4)
+
+            if os.getenv("DATASET_LOCATION", "LOCAL") == "S3":
+                aws_key = os.environ.get("AWS_ACCESS_KEY_C4DM02")
+                aws_secret = os.environ.get("AWS_SECRET_KEY_C4DM02")
+                s3 = boto3.client(
+                    "s3",
+                    endpoint_url="https://ceph-private-object-rgw.comp-research.qmul.ac.uk",
+                    aws_access_key_id=aws_key,
+                    aws_secret_access_key=aws_secret,
+                )
+                s3_path = config["s3_path"]
+                s3_key = f"{s3_path}/{task_name}_probing_results_size{train_size}.json"
+                result_b = json.dumps(results, indent=4).encode("utf-8")
+                s3.put_object(Bucket="c4dm-02", Key=s3_key, Body=result_b)
+            else:
+                with open(
+                    Path(root_path)
+                    / f"{task_name}_probing_results_size{train_size}.json",
+                    "w",
+                ) as f:
+                    json.dump(results, f, indent=4)
 
 
 def main():
@@ -134,8 +169,6 @@ def main():
     np.random.seed(1234)
     with open(config_file, "r") as f:
         config = yaml.safe_load(f)
-    os.nice(10)
-    torch.set_num_threads(1)
     evaluate(config, args.ckpt)
 
 
