@@ -13,8 +13,8 @@ def get_audio_file(file_path: str) -> bytes:
     return wav, sr
 
 def read_from_s3(file_path: str) -> bytes:
-    aws_key = os.getenv("AWS_ACCESS_KEY_ID")
-    aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY")
+    aws_key = os.getenv("AWS_ACCESS_KEY")
+    aws_secret = os.getenv("AWS_SECRET_KEY")
     assert aws_key is not None, "AWS_ACCESS_KEY not set"
     assert aws_secret is not None, "AWS_SECRET_KEY not set"
     s3 = boto3.client(
