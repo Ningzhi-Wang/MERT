@@ -1387,280 +1387,329 @@ class MERTModel(BaseFairseqModel):
     ) -> Dict[str, torch.Tensor]:
         """output layer is 1-based"""
         # with autocast(device_type=source.device.type,  dtype=torch.float32):
+        with torch.profiler.record_function("forward_internal"):
 
-        if self.mixture_prob > 0:
-            # compute cqt before mixture
-            if self.cfg.audio_cqt_loss_m:
-                cqt_targets = self.encoder_cqt_model.compute_cqt(source)
-            if self.cfg.audio_mel_loss_m:
-                mel_targets = self.encoder_mel_model.compute_mel(source)
-            with torch.no_grad():
-                batch_audios = torch.clone(source)
-                for i in range(source.shape[0]):
-                    if torch.rand(1).item() > self.mixture_prob:
-                        try:
-                            source[i] = self.inbatch_noise_augment(
-                                target_audio=batch_audios[i],
-                                target_audio_idx=i,
-                                batch_audios=batch_audios,
-                                noise_len_min=self.inbatch_noise_augment_len_range[0],
-                                noise_len_max=self.inbatch_noise_augment_len_range[1],
-                                n_noise_min=self.inbatch_noise_augment_number_range[0],
-                                n_noise_max=self.inbatch_noise_augment_number_range[1],
-                                noise_vol=self.inbatch_noise_augment_volume,
-                            )
-                        except:
-                            source[i] = batch_audios[i]
-
-        features = self.forward_features(source)
-        if target_list is not None:
-            features, target_list = self.forward_targets(features, target_list)
-
-        features_pen = features.float().pow(2).mean()
-
-        features = features.transpose(1, 2)  # BxTxC
-
-        if self.cfg.feature_extractor_cqt:
-            features_cqt = self.feature_extractor_cqt(source).transpose(1, 2)
-            features_cqt = features_cqt[:, : features.shape[1], :]  # align shape
-            # version 1
-            # features = features + features_cqt
-            # features = self.layer_norm(features)
-            # version 2
-            # features_cqt = self.post_cqt_feature_proj(features_cqt) # v2
-            # features = self.layer_norm(features) + self.layer_norm(features_cqt)
-            # version 3
-            features = torch.cat([features, features_cqt], 2)
-            features = self.layer_norm(features)  # BxTxC
-        else:
-            features = self.layer_norm(features)
-        unmasked_features = features.clone()
-
-        if padding_mask is not None:
-            padding_mask = self.forward_padding_mask(features, padding_mask)
-
-        if self.post_extract_proj is not None:
-            features = self.post_extract_proj(features)
-            if self.post_proj_layer_norm is not None:
-                features = self.post_proj_layer_norm(features)
-
-        features = self.dropout_input(features)
-        unmasked_features = self.dropout_features(unmasked_features)
-
-        if mask:
-            x, masked_indices, ids_restore, masked_padding_mask = self.apply_mask(
-                features, self.mask_type, padding_mask, target_list
-            )
-            # masked_padding_mask = padding_mask if self.mask_type != "mae" else padding_mask[masked_indices]
-        else:
-            x = features
-            masked_indices = None
-            ids_restore = None
-            masked_padding_mask = padding_mask
-
-
-        # feature: (B, T, D), float
-        # target: (B, T), long
-        # x: (B, T, D), float
-        # padding_mask: (B, T), bool
-        # mask_indices: (B, T), bool
-        x, layer_results = self.encoder(
-            x,
-            padding_mask=masked_padding_mask,
-            layer=None if output_layer is None else output_layer - 1,
-        )
-
-        if features_only:
-            return {
-                "x": x,
-                "padding_mask": padding_mask,
-                "features": features,
-                "layer_results": layer_results,
-                "masked_indices": masked_indices,
-                "id_restore": ids_restore,
-            }
-
-        if self.decoder_type != 'none':
-            x = self.decoder_proj(x)
-
-            if self.mask_encode:
-                masked_tokens = self.mask_emb.expand(
-                    x.shape[0],
-                    ids_restore.shape[1] - x.shape[1],
-                    -1,
-                )
-                x = torch.cat((x, masked_tokens), dim=1)
-                restore_indices = (
-                    ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
-                )
-                x = torch.gather(x, dim=1, index=restore_indices)
-            x, _ = self.decoder(x, padding_mask=padding_mask)
-
-        def compute_pred(proj_x, target, label_embs, logit_temp=None):
-            # skip the codebook that is not selected
-            if proj_x is None:
-                return None
-            # compute logits for the i-th label set
-            y = torch.index_select(label_embs, 0, target.long())
-            negs = label_embs.unsqueeze(1).expand(-1, proj_x.size(0), -1)
-            if self.target_glu:
-                y = self.target_glu(y)
-                negs = self.target_glu(negs)
-            # proj_x: (S, D)
-            # y: (S, D)
-            # negs: (Neg, S, D)
-            if logit_temp is not None:
-                return self.compute_nce_learned_temp(proj_x, y, negs, logit_temp)
-            else:
-                return self.compute_nce(proj_x, y, negs)
-
-        label_embs_list = self.label_embs_concat.split(self.num_classes, 0)
-
-        if not self.skip_masked:
-            # masked_indices = torch.logical_and(~padding_mask, mask_indices)
-            # @yizhilll: TODO merge the codes heredui
-            if self.random_codebook <= 0:
-                proj_x_m = self.final_proj(x[masked_indices])
-                if self.untie_final_proj:
-                    proj_x_m_list = proj_x_m.chunk(len(target_list), dim=-1)
-                else:
-                    proj_x_m_list = [
-                        proj_x_m for _ in range(len(target_list))
-                    ]  # no extra RAM taken here
-            else:
-                # pass
-                selected_books = np.random.choice(
-                    len(target_list), self.random_codebook
-                )
-                proj_x_m_list = []
-                for i in range(len(target_list)):
-                    if i in selected_books:
-                        if self.untie_final_proj:
-                            proj_x_m_list.append(self.final_projs[i](x[masked_indices]))
-                        else:
-                            proj_x_m_list.append(self.final_proj(x[masked_indices]))
-                    else:
-                        proj_x_m_list.append(None)
-
-            if self.learnable_temp:
-                logit_m_list = [
-                    compute_pred(
-                        proj_x_m, t[masked_indices], label_embs_list[i], logit_temp
-                    )
-                    for i, (proj_x_m, t, logit_temp), in enumerate(
-                        zip(proj_x_m_list, target_list, self.logit_temp_list)
-                    )
-                ]
-            else:
-                logit_m_list = [
-                    compute_pred(proj_x_m, t[masked_indices], label_embs_list[i])
-                    for i, (proj_x_m, t) in enumerate(zip(proj_x_m_list, target_list))
-                ]
-            # else:
-            #     # # mute to optimize the codes
-            #     proj_x_m_list = [proj_x_m for _ in range(len(target_list))]
-            #     if self.learnable_temp:
-            #         logit_m_list = [
-            #             compute_pred(proj_x_m, t[masked_indices], label_embs_list[i], logit_temp)
-            #             for i, (t, logit_temp),  in enumerate(zip(target_list, self.logit_temp_list))
-            #         ]
-
-            #     else:
-            #         logit_m_list = [
-            #             compute_pred(proj_x_m, t[masked_indices], label_embs_list[i])
-            #             for i, t in enumerate(target_list)
-            #         ]
-        else:
-            logit_m_list = [None for _ in target_list]
-
-        if not self.skip_nomask and self.mask_type == "hubert":
-            # nomask_indices = torch.logical_and(~padding_mask, ~mask_indices)
-            proj_x_u = self.final_proj(x[ids_restore])
-            if self.untie_final_proj:
-                proj_x_u_list = proj_x_u.chunk(len(target_list), dim=-1)
-            else:
-                proj_x_u_list = [proj_x_u for _ in range(len(target_list))]
-
-            logit_u_list = [
-                compute_pred(proj_x_u, t[ids_restore], label_embs_list[i])
-                for i, (proj_x_u, t) in enumerate(zip(proj_x_u_list, target_list))
-            ]
-        else:
-            logit_u_list = [None for _ in target_list]
-
-        # if self.emb_grad_mult > 0 and self.emb_grad_mult !=1.0:
-        #     self.label_embs_concat = GradMultiply.apply(self.label_embs_concat, self.emb_grad_mult)
-
-        # word_embeddin =  ∗α+word_embedding .detach()∗(1−α).
-        # self.label_embs_concat = self.label_embs_concat * self.emb_grad_mult + self.label_embs_concat.detach()*(1-self.emb_grad_mult)
-
-        result = {
-            "logit_m_list": logit_m_list,
-            "logit_u_list": logit_u_list,
-            "padding_mask": padding_mask,
-            "features_pen": features_pen,
-        }
-
-        if self.cfg.audio_cqt_loss_m:
-
-            if cqt_labels is not None:
-                cqt_targets = cqt_labels[
-                    : masked_indices.shape[0], : masked_indices.shape[1]
-                ]  # dump the last
-            else:
-                if self.mixture_prob > 0:
-                    # no need to compute again
-                    assert cqt_targets is not None
-                else:
+            if self.mixture_prob > 0:
+                # compute cqt before mixture
+                if self.cfg.audio_cqt_loss_m:
                     cqt_targets = self.encoder_cqt_model.compute_cqt(source)
-                cqt_targets = cqt_targets[
-                    : masked_indices.shape[0], : masked_indices.shape[1]
-                ]  # dump the last
-
-            cqt_forward_type = (
-                "masked_logistic_output"
-                if self.cfg.logistic_cqt
-                else "masked_transformer_output"
-            )
-            cqt_pred_m = self.encoder_cqt_model(
-                x[masked_indices], forward_type=cqt_forward_type
-                # x, forward_type=cqt_forward_type
-            )
-            # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape)
-            cqt_loss_m = self.encoder_cqt_model.criterion(
-                cqt_pred_m, cqt_targets[masked_indices]
-                # cqt_pred_m, cqt_targets
-            )
-            result["cqt_pred_m"] = cqt_loss_m
-
-        if self.cfg.audio_mel_loss_m:
-            if mel_labels is not None:
-                mel_targets = mel_labels[
-                    : masked_indices.shape[0], : masked_indices.shape[1]
-                ]  # dump the last
-            else:
-                if self.mixture_prob > 0:
-                    # no need to compute again
-                    assert mel_targets is not None
-                else:
+                if self.cfg.audio_mel_loss_m:
                     mel_targets = self.encoder_mel_model.compute_mel(source)
-                mel_targets = mel_targets[
-                    : masked_indices.shape[0], : masked_indices.shape[1]
-                ]  # dump the last
+                with torch.no_grad():
+                    batch_audios = torch.clone(source)
+                    for i in range(source.shape[0]):
+                        if torch.rand(1).item() > self.mixture_prob:
+                            try:
+                                source[i] = self.inbatch_noise_augment(
+                                    target_audio=batch_audios[i],
+                                    target_audio_idx=i,
+                                    batch_audios=batch_audios,
+                                    noise_len_min=self.inbatch_noise_augment_len_range[0],
+                                    noise_len_max=self.inbatch_noise_augment_len_range[1],
+                                    n_noise_min=self.inbatch_noise_augment_number_range[0],
+                                    n_noise_max=self.inbatch_noise_augment_number_range[1],
+                                    noise_vol=self.inbatch_noise_augment_volume,
+                                )
+                            except:
+                                source[i] = batch_audios[i]
+            with torch.profiler.record_function("feature_extraction"):
+                features = self.forward_features(source)
+                if target_list is not None:
+                    features, target_list = self.forward_targets(features, target_list)
 
-            mel_pred_m = self.encoder_mel_model(x[masked_indices])
-            # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape)
-            mel_loss_m = self.encoder_mel_model.criterion(
-                mel_pred_m, mel_targets[masked_indices]
-            )
-            result["mel_pred_m"] = mel_loss_m
+                features_pen = features.float().pow(2).mean()
 
-        if self.learnable_temp:
-            # for i in range(len(self.logit_temp_list)):
-            for i in range(self.logit_temp_list.shape[0]):
-                result[f"logit_temp_{i}"] = self.logit_temp_list[i].item()
+                features = features.transpose(1, 2)  # BxTxC
 
-        return result
+                if self.cfg.feature_extractor_cqt:
+                    features_cqt = self.feature_extractor_cqt(source).transpose(1, 2)
+                    features_cqt = features_cqt[:, : features.shape[1], :]  # align shape
+                    # version 1
+                    # features = features + features_cqt
+                    # features = self.layer_norm(features)
+                    # version 2
+                    # features_cqt = self.post_cqt_feature_proj(features_cqt) # v2
+                    # features = self.layer_norm(features) + self.layer_norm(features_cqt)
+                    # version 3
+                    features = torch.cat([features, features_cqt], 2)
+                    features = self.layer_norm(features)  # BxTxC
+                else:
+                    features = self.layer_norm(features)
+                unmasked_features = features.clone()
+
+                if padding_mask is not None:
+                    padding_mask = self.forward_padding_mask(features, padding_mask)
+
+                if self.post_extract_proj is not None:
+                    features = self.post_extract_proj(features)
+                    if self.post_proj_layer_norm is not None:
+                        features = self.post_proj_layer_norm(features)
+
+                features = self.dropout_input(features)
+                unmasked_features = self.dropout_features(unmasked_features)
+
+            with torch.profiler.record_function("masking"):
+                if mask:
+                    x, masked_indices, ids_restore, masked_padding_mask = self.apply_mask(
+                        features, self.mask_type, padding_mask, target_list
+                    )
+                    # masked_padding_mask = padding_mask if self.mask_type != "mae" else padding_mask[masked_indices]
+                else:
+                    x = features
+                    masked_indices = None
+                    ids_restore = None
+                    masked_padding_mask = padding_mask
+
+
+            # feature: (B, T, D), float
+            # target: (B, T), long
+            # x: (B, T, D), float
+            # padding_mask: (B, T), bool
+            # mask_indices: (B, T), bool
+            with torch.profiler.record_function("mert_encode"):
+                x, layer_results = self.encoder(
+                    x,
+                    padding_mask=masked_padding_mask,
+                    layer=None if output_layer is None else output_layer - 1,
+                )
+
+            if features_only:
+                return {
+                    "x": x,
+                    "padding_mask": padding_mask,
+                    "features": features,
+                    "layer_results": layer_results,
+                    "masked_indices": masked_indices,
+                    "id_restore": ids_restore,
+                }
+
+            if self.decoder_type != 'none':
+                with torch.profiler.record_function("mert_decode"):
+                    x = self.decoder_proj(x)
+                    if self.mask_encode:
+                        masked_tokens = self.mask_emb.expand(
+                            x.shape[0],
+                            ids_restore.shape[1] - x.shape[1],
+                            -1,
+                        )
+                        x = torch.cat((x, masked_tokens), dim=1)
+                        restore_indices = (
+                            ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
+                        )
+                        x = torch.gather(x, dim=1, index=restore_indices)
+                    x, _ = self.decoder(x, padding_mask=padding_mask)
+
+            def compute_pred(proj_x, target, label_embs, logit_temp=None):
+                # skip the codebook that is not selected
+                if proj_x is None:
+                    return None
+                # compute logits for the i-th label set
+                y = torch.index_select(label_embs, 0, target.long())
+                negs = label_embs.unsqueeze(1).expand(-1, proj_x.size(0), -1)
+                if self.target_glu:
+                    y = self.target_glu(y)
+                    negs = self.target_glu(negs)
+                # proj_x: (S, D)
+                # y: (S, D)
+                # negs: (Neg, S, D)
+                if logit_temp is not None:
+                    return self.compute_nce_learned_temp(proj_x, y, negs, logit_temp)
+                else:
+                    return self.compute_nce(proj_x, y, negs)
+
+            def compute_pred_fast(proj_x, target, label_embs, logit_temp=None):
+                """
+                HuBERT-style:
+                  - logits: (S, 1 + Neg)
+                    logits[:,0]  = sim(x, pos)
+                    logits[:,1:] = sim(x, all labels) with the pos-label entry masked to -inf
+                """
+                if proj_x is None:
+                    return None
+
+                target = target.long()              # (S,)
+                S, D = proj_x.shape
+                Neg = label_embs.size(0)
+
+                # Apply target_glu ONCE to label table (same semantics as applying it to y and negs)
+                E = self.target_glu(label_embs) if self.target_glu else label_embs   # (Neg, D)
+
+                # Cosine similarity == dot(normalize(x), normalize(E))
+                X = F.normalize(proj_x.float(), p=2, dim=-1)                # (S, D)
+                En = F.normalize(E.float(), p=2, dim=-1)               # (Neg, D)
+
+                # All class logits in one GEMM: (S,D) @ (D,Neg) -> (S,Neg)
+                all_logits = X @ En.t()                                              # (S, Neg)
+
+                # Mask the "neg that equals pos" (in HuBERT this is exactly the target column)
+                all_logits.scatter_(1, target.view(-1, 1), float("-inf"))
+
+                # Positive logits (S,1)
+                pos = all_logits.new_empty((S, 1))
+                # compute pos directly (avoid -inf): gather before masking or recompute
+                pos = (X * En.index_select(0, target)).sum(dim=-1, keepdim=True)      # (S,1)
+
+                # Temperature handling
+                # In fairseq HuBERT, it's usually `logits /= self.logit_temp` :contentReference[oaicite:1]{index=1}
+                temp = logit_temp if logit_temp is not None else getattr(self, "logit_temp", None)
+                if temp is not None:
+                    all_logits = all_logits / temp
+                    pos = pos / temp
+
+                # Return HuBERT layout: (S, 1+Neg)
+                return torch.cat([pos, all_logits], dim=1)
+        
+            with torch.profiler.record_function("compute_nce"):
+
+                label_embs_list = self.label_embs_concat.split(self.num_classes, 0)
+
+                if not self.skip_masked:
+                    # masked_indices = torch.logical_and(~padding_mask, mask_indices)
+                    # @yizhilll: TODO merge the codes heredui
+                    if self.random_codebook <= 0:
+                        proj_x_m = self.final_proj(x[masked_indices])
+                        if self.untie_final_proj:
+                            proj_x_m_list = proj_x_m.chunk(len(target_list), dim=-1)
+                        else:
+                            proj_x_m_list = [
+                                proj_x_m for _ in range(len(target_list))
+                            ]  # no extra RAM taken here
+                    else:
+                        # pass
+                        selected_books = np.random.choice(
+                            len(target_list), self.random_codebook
+                        )
+                        proj_x_m_list = []
+                        for i in range(len(target_list)):
+                            if i in selected_books:
+                                if self.untie_final_proj:
+                                    proj_x_m_list.append(self.final_projs[i](x[masked_indices]))
+                                else:
+                                    proj_x_m_list.append(self.final_proj(x[masked_indices]))
+                            else:
+                                proj_x_m_list.append(None)
+
+                    with torch.profiler.record_function("logit_computation"):
+                        if self.learnable_temp:
+                            logit_m_list = [
+                                compute_pred(
+                                    proj_x_m, t[masked_indices], label_embs_list[i], logit_temp
+                                )
+                                for i, (proj_x_m, t, logit_temp), in enumerate(
+                                    zip(proj_x_m_list, target_list, self.logit_temp_list)
+                                )
+                            ]
+                        else:
+                            logit_m_list = [
+                                compute_pred(proj_x_m, t[masked_indices], label_embs_list[i])
+                                for i, (proj_x_m, t) in enumerate(zip(proj_x_m_list, target_list))
+                            ]
+                    # else:
+                    #     # # mute to optimize the codes
+                    #     proj_x_m_list = [proj_x_m for _ in range(len(target_list))]
+                    #     if self.learnable_temp:
+                    #         logit_m_list = [
+                    #             compute_pred(proj_x_m, t[masked_indices], label_embs_list[i], logit_temp)
+                    #             for i, (t, logit_temp),  in enumerate(zip(target_list, self.logit_temp_list))
+                    #         ]
+
+                    #     else:
+                    #         logit_m_list = [
+                    #             compute_pred(proj_x_m, t[masked_indices], label_embs_list[i])
+                    #             for i, t in enumerate(target_list)
+                    #         ]
+                else:
+                    logit_m_list = [None for _ in target_list]
+
+                if not self.skip_nomask and self.mask_type == "hubert":
+                    # nomask_indices = torch.logical_and(~padding_mask, ~mask_indices)
+                    proj_x_u = self.final_proj(x[ids_restore])
+                    if self.untie_final_proj:
+                        proj_x_u_list = proj_x_u.chunk(len(target_list), dim=-1)
+                    else:
+                        proj_x_u_list = [proj_x_u for _ in range(len(target_list))]
+
+                    logit_u_list = [
+                        compute_pred(proj_x_u, t[ids_restore], label_embs_list[i])
+                        for i, (proj_x_u, t) in enumerate(zip(proj_x_u_list, target_list))
+                    ]
+                else:
+                    logit_u_list = [None for _ in target_list]
+
+            # if self.emb_grad_mult > 0 and self.emb_grad_mult !=1.0:
+            #     self.label_embs_concat = GradMultiply.apply(self.label_embs_concat, self.emb_grad_mult)
+
+            # word_embeddin =  ∗α+word_embedding .detach()∗(1−α).
+            # self.label_embs_concat = self.label_embs_concat * self.emb_grad_mult + self.label_embs_concat.detach()*(1-self.emb_grad_mult)
+
+                result = {
+                    "logit_m_list": logit_m_list,
+                    "logit_u_list": logit_u_list,
+                    "padding_mask": padding_mask,
+                    "features_pen": features_pen,
+                }
+
+                with torch.profiler.record_function("audio_reconstruction"):
+                    if self.cfg.audio_cqt_loss_m:
+
+                        if cqt_labels is not None:
+                            cqt_targets = cqt_labels[
+                                : masked_indices.shape[0], : masked_indices.shape[1]
+                            ]  # dump the last
+                        else:
+                            if self.mixture_prob > 0:
+                                # no need to compute again
+                                assert cqt_targets is not None
+                            else:
+                                cqt_targets = self.encoder_cqt_model.compute_cqt(source)
+                            cqt_targets = cqt_targets[
+                                : masked_indices.shape[0], : masked_indices.shape[1]
+                            ]  # dump the last
+
+                        cqt_forward_type = (
+                            "masked_logistic_output"
+                            if self.cfg.logistic_cqt
+                            else "masked_transformer_output"
+                        )
+                        cqt_pred_m = self.encoder_cqt_model(
+                            x[masked_indices], forward_type=cqt_forward_type
+                            # x, forward_type=cqt_forward_type
+                        )
+                        # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape)
+                        cqt_loss_m = self.encoder_cqt_model.criterion(
+                            cqt_pred_m, cqt_targets[masked_indices]
+                            # cqt_pred_m, cqt_targets
+                        )
+                        result["cqt_pred_m"] = cqt_loss_m
+
+                    if self.cfg.audio_mel_loss_m:
+                        if mel_labels is not None:
+                            mel_targets = mel_labels[
+                                : masked_indices.shape[0], : masked_indices.shape[1]
+                            ]  # dump the last
+                        else:
+                            if self.mixture_prob > 0:
+                                # no need to compute again
+                                assert mel_targets is not None
+                            else:
+                                mel_targets = self.encoder_mel_model.compute_mel(source)
+                            mel_targets = mel_targets[
+                                : masked_indices.shape[0], : masked_indices.shape[1]
+                            ]  # dump the last
+
+                        mel_pred_m = self.encoder_mel_model(x[masked_indices])
+                        # logger.info(x[masked_indices].shape, cqt_pred_m.shape, cqt_targets.shape)
+                        mel_loss_m = self.encoder_mel_model.criterion(
+                            mel_pred_m, mel_targets[masked_indices]
+                        )
+                        result["mel_pred_m"] = mel_loss_m
+
+                    if self.learnable_temp:
+                        # for i in range(len(self.logit_temp_list)):
+                        for i in range(self.logit_temp_list.shape[0]):
+                            result[f"logit_temp_{i}"] = self.logit_temp_list[i].item()
+
+                return result
 
     def extract_features(
         self,
