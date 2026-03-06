@@ -318,6 +318,10 @@ class MERTConfig(FairseqDataclass):
     )
 
     # positional embeddings
+    pos_type: str = field(
+        default="conv",
+        metadata={"help": "type of positional embeddings to use (conv or abs)"},
+    )
     conv_pos: int = field(
         default=128,
         metadata={"help": "number of filters for convolutional positional embeddings"},
@@ -805,6 +809,7 @@ class MERTModel(BaseFairseqModel):
 
 
         self.wav_normalize = cfg.wav_normalize
+        self.conv_pos = cfg.pos_type == "conv"
 
         if not self.learnable_temp:
             self.logit_temp = cfg.logit_temp
@@ -826,7 +831,7 @@ class MERTModel(BaseFairseqModel):
         )
 
         encoder_cfg = cfg.copy()
-        encoder_cfg.checkpoint_activations = True
+        encoder_cfg.checkpoint_activations = False
 
         if cfg.attention_relax > 0 or cfg.deepnorm or cfg.subln:
             if cfg.subln:
@@ -834,10 +839,10 @@ class MERTModel(BaseFairseqModel):
             if cfg.deepnorm:
                 assert not cfg.layer_norm_first
 
-            self.encoder = TransformerEncoder_extend(encoder_cfg)
+            self.encoder = TransformerEncoder_extend(encoder_cfg, skip_pos_conv=not self.conv_pos)
 
         else:
-            self.encoder = TransformerEncoder(encoder_cfg)
+            self.encoder = TransformerEncoder(encoder_cfg, skip_pos_conv=not self.conv_pos)
 
         if self.do_cnn_feat_stable_layernorm:
             self.layer_norm = LayerNorm(self.embed, elementwise_affine=False)
@@ -1446,12 +1451,18 @@ class MERTModel(BaseFairseqModel):
 
         features = self.dropout_input(features)
         unmasked_features = self.dropout_features(unmasked_features)
+        if not self.conv_pos:
+            pos = torch.arange(features.size(1), device=features.device, dtype=features.dtype)
+            pos_emb = get_1d_sincos_pos_embed(
+                features.size(2), pos
+            )
+            features = features + pos_emb.unsqueeze(0)
+
 
         if mask:
             x, masked_indices, ids_restore, masked_padding_mask = self.apply_mask(
                 features, self.mask_type, padding_mask, target_list
             )
-            # masked_padding_mask = padding_mask if self.mask_type != "mae" else padding_mask[masked_indices]
         else:
             x = features
             masked_indices = None
@@ -1604,12 +1615,6 @@ class MERTModel(BaseFairseqModel):
             #         logit_m_list = [
             #             compute_pred(proj_x_m, t[masked_indices], label_embs_list[i], logit_temp)
             #             for i, (t, logit_temp),  in enumerate(zip(target_list, self.logit_temp_list))
-            #         ]
-
-            #     else:
-            #         logit_m_list = [
-            #             compute_pred(proj_x_m, t[masked_indices], label_embs_list[i])
-            #             for i, t in enumerate(target_list)
             #         ]
         else:
             logit_m_list = [None for _ in target_list]
