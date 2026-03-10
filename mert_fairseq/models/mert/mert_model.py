@@ -1390,7 +1390,7 @@ class MERTModel(BaseFairseqModel):
         mel_labels: Optional[torch.Tensor] = None,
         mask: bool = True,
         features_only: bool = False,
-        output_layer: Optional[int] = None,
+        decoder_feature: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """output layer is 1-based"""
         # with autocast(device_type=source.device.type,  dtype=torch.float32):
@@ -1478,10 +1478,9 @@ class MERTModel(BaseFairseqModel):
         x, layer_results = self.encoder(
             x,
             padding_mask=masked_padding_mask,
-            layer=None if output_layer is None else output_layer - 1,
         )
 
-        if features_only:
+        if features_only and not decoder_feature:
             return {
                 "x": x,
                 "padding_mask": padding_mask,
@@ -1504,8 +1503,18 @@ class MERTModel(BaseFairseqModel):
                     ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]).long()
                 )
                 x = torch.gather(x, dim=1, index=restore_indices)
-            x, _ = self.decoder(x, padding_mask=padding_mask)
+            x, dec_layer_results = self.decoder(x, padding_mask=padding_mask)
 
+        if features_only and decoder_feature:
+            return {
+                "x": x,
+                "padding_mask": padding_mask,
+                "features": features,
+                "layer_results": dec_layer_results,
+                "masked_indices": masked_indices,
+                "id_restore": ids_restore,
+            }
+        
         def compute_pred(proj_x, target, label_embs, logit_temp=None):
             # skip the codebook that is not selected
             if proj_x is None:
@@ -1714,7 +1723,7 @@ class MERTModel(BaseFairseqModel):
         mask: bool = False,
         ret_conv: bool = False,
         ret_layer: bool = True,
-        output_layer: Optional[int] = None,
+        decoder_feature: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         source = source.squeeze(1) if source.dim() > 2 else source
         res = self.forward(
@@ -1722,7 +1731,7 @@ class MERTModel(BaseFairseqModel):
             padding_mask=padding_mask,
             mask=mask,
             features_only=True,
-            output_layer=output_layer,
+            decoder_feature=decoder_feature,
         )
         if ret_conv:
             return res["features"]
