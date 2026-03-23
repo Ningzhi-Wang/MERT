@@ -1492,7 +1492,8 @@ class MERTModel(BaseFairseqModel):
 
         if self.decoder_type != 'none':
             x = self.decoder_proj(x)
-            if self.mask_encode:
+            # The model needs to be in masking mode and MAE mode.
+            if self.mask_encode and mask: 
                 masked_tokens = self.mask_emb.expand(
                     x.shape[0],
                     ids_restore.shape[1] - x.shape[1],
