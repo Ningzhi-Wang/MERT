@@ -1,8 +1,9 @@
 import math
 import numpy as np
 import torch
+import torch.distributed as torch_dist
 import torch.nn.functional as F
-from torch import distributions as dist
+from torch import distributions as torch_distributions
 
 from torch import nn
 
@@ -68,12 +69,43 @@ def discretized_mix_logistic_loss(
 
 
 class Scaler(nn.Module):
-    def __init__(self, init_min: float = math.inf, init_max: float = -math.inf):
+    def __init__(
+        self,
+        init_min: float = math.inf,
+        init_max: float = -math.inf,
+        adaptive: bool = True,
+        warmup_updates: int = -1,
+        sync_stats: bool = False,
+    ):
         super().__init__()
         self.register_buffer("min", torch.tensor(init_min).float())
         self.register_buffer("max", torch.tensor(init_max).float())
+        self.adaptive = adaptive
+        self.warmup_updates = warmup_updates
+        self.sync_stats = sync_stats
+        self.num_updates = 0
+
+    def set_num_updates(self, num_updates: int):
+        self.num_updates = num_updates
+
+    def _should_update(self) -> bool:
+        return self.adaptive and self.training and (
+            self.warmup_updates < 0 or self.num_updates < self.warmup_updates
+        )
+
+    def _get_min_max(self, x: torch.Tensor):
+        x_min = x.detach().amin().to(torch.float32)
+        x_max = x.detach().amax().to(torch.float32)
+        if self.sync_stats and torch_dist.is_available() and torch_dist.is_initialized():
+            torch_dist.all_reduce(x_min, op=torch_dist.ReduceOp.MIN)
+            torch_dist.all_reduce(x_max, op=torch_dist.ReduceOp.MAX)
+        return x_min, x_max
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._should_update():
+            x_min, x_max = self._get_min_max(x)
+            self.min.copy_(torch.minimum(self.min, x_min))
+            self.max.copy_(torch.maximum(self.max, x_max))
         min_val = self.min.to(x.device)
         max_val = self.max.to(x.device)
         return (x - min_val) / max((max_val - min_val), 1e-4) * 2 - 1
@@ -83,19 +115,8 @@ class Scaler(nn.Module):
         max_val = self.max.to(x.device)
         return (x + 1) / 2 * (max_val - min_val) + min_val
 
-
-def adaptive_update_hook(module: Scaler, input):
-    x = input[0]
-    if module.training:
-        module.min.fill_(torch.min(module.min, x.min()))
-        module.max.fill_(torch.max(module.max, x.max()))
-
-
 def get_scaler(adaptive: bool = True, **kwargs) -> Scaler:
-    scaler = Scaler(**kwargs)
-    if adaptive:
-        scaler.register_forward_pre_hook(adaptive_update_hook)
-    return scaler
+    return Scaler(adaptive=adaptive, **kwargs)
 
 def get_individual_scaler(x):
     x_min = torch.amin(x, dim=(-1, -2))
@@ -105,9 +126,12 @@ def get_individual_scaler(x):
 
 
 def logistic_dist(a, b):
-    base_distribution = dist.Uniform(0, 1)
-    transforms = [dist.SigmoidTransform().inv, dist.AffineTransform(loc=a, scale=b)]
-    return dist.TransformedDistribution(base_distribution, transforms)
+    base_distribution = torch_distributions.Uniform(0, 1)
+    transforms = [
+        torch_distributions.SigmoidTransform().inv,
+        torch_distributions.AffineTransform(loc=a, scale=b),
+    ]
+    return torch_distributions.TransformedDistribution(base_distribution, transforms)
 
 def mix_logistic_loss(x, y, min_scale=-7.):
     x = x.permute(0, 2, 1)
@@ -119,7 +143,7 @@ def mix_logistic_loss(x, y, min_scale=-7.):
     log_scales = torch.clamp(x[..., 2 * nr_mix : 3 * nr_mix].to(torch.float32), min_scale)
     z = (y - mean).to(torch.float32) / torch.exp(log_scales)
     mix_probs = F.log_softmax(logit_probs, dim=-1).to(torch.float32)
-    log_probs = -log_scales - 2. * F.softplus(-z)
+    log_probs = -z - log_scales - 2. * F.softplus(-z)
     loss = -torch.logsumexp(log_probs + mix_probs, dim=-1).mean(dim=1)
     return loss.mean().to(torch.float16)
 

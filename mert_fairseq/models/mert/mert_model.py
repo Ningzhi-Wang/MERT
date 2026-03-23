@@ -23,6 +23,10 @@ from fairseq import utils
 from fairseq.data.data_utils import compute_mask_indices
 from fairseq.data.dictionary import Dictionary
 from fairseq.dataclass import ChoiceEnum, FairseqDataclass
+from fairseq.distributed.fully_sharded_data_parallel import FullyShardedDataParallel
+from fairseq.models.wav2vec.utils import pad_to_multiple
+from fairseq.models.wav2vec.wav2vec2 import TransformerSentenceEncoderWithAdapterLayer
+from fairseq.utils import index_put
 from fairseq.models import BaseFairseqModel, register_model
 from fairseq.models.wav2vec.wav2vec2 import (
     EXTRACTOR_MODE_CHOICES,
@@ -102,6 +106,10 @@ class MERTConfig(FairseqDataclass):
     )
     decoder_type: str = field(
         default='none', metadata={"help": "which architecture to use. none means no decoder."}
+    )
+    decoder_causal: bool = field(
+        default=False,
+        metadata={"help": "whether to use causal self-attention in the wav2vec decoder"},
     )
 
     # dropouts
@@ -394,6 +402,10 @@ class MERTConfig(FairseqDataclass):
         default=84,
         metadata={"help": "the bins of CQT feature"},
     )
+    patch_size: int = field(
+        default=16,
+        metadata={"help": "the patch size for the spectrogram input when audio_extract_type is spec_mlp"},
+    )
     # cqt extractor
     feature_extractor_cqt: bool = field(
         default=False,
@@ -503,6 +515,12 @@ class MERTConfig(FairseqDataclass):
         default=False,
         metadata={"help": "whether logistic distribution as CQT loss"},
     )
+    scaler_warmup_updates: int = field(
+        default=5000,
+        metadata={
+            "help": "number of updates to adaptively calibrate scaler stats before freezing them"
+        },
+    )
 
 
 class model_mel_pred(torch.nn.Module):
@@ -567,9 +585,18 @@ class model_mel_pred(torch.nn.Module):
 
 
 class model_cqt_pred(torch.nn.Module):
-    def __init__(self, input_dim, n_bins=84, sr=16000, freq=50, logistic=False):
+    def __init__(
+        self,
+        input_dim,
+        n_bins=84,
+        sr=16000,
+        freq=50,
+        logistic=False,
+        scaler_warmup_updates=5000,
+    ):
         super().__init__()
         self.epsilon = 1e-10
+        self.logistic = logistic
         # Getting Mel Spectrogram on the fly
         self.spec_layer = nnAudioFeatures.cqt.CQT(
             sr=sr,
@@ -603,27 +630,28 @@ class model_cqt_pred(torch.nn.Module):
 
         # 1-layer version
         if logistic:
+            self.nr_mix = 10
+            self.fc = nn.Linear(input_dim, n_bins * self.nr_mix)
+            
             # self.fc = nn.Sequential(
-            #     nn.Linear(input_dim, 120),
-            #     nn.Linear(input_dim, n_bins * 30),
-            #     nn.Tanh()
+            #     nn.Linear(input_dim, n_bins), nn.ReLU(), nn.BatchNorm1d(n_bins)
             # )
-            self.fc = nn.Sequential(
-                nn.Linear(input_dim, n_bins), nn.ReLU(), nn.BatchNorm1d(n_bins)
-            )
             self.conv = nn.Sequential(
-                nn.Conv1d(1, 30, 3, 1, 1),
-                # nn.Tanh()
-                # LayerNorm(input_dim, elementwise_affine=False)
+                nn.Conv1d(self.nr_mix, 30, kernel_size=1),
             )
-            # self.target_scaler = get_individual_scaler
-            # self.target_scaler = get_scaler(init_min=-1e-4, init_max=45)
-            # Apply no normalization for continuous logisitc loss
+            self.target_scaler = get_scaler(
+                adaptive=True,
+                init_min=-12,
+                init_max=4,
+                warmup_updates=scaler_warmup_updates,
+                sync_stats=True,
+            )
             self.criterion = lambda p, d: mix_logistic_loss(
                 p,
-                d.unsqueeze(1),
+                self.target_scaler(torch.clamp(d, min=1e-5).log())
+                .clamp(-1.0, 1.0)
+                .unsqueeze(1),
             )
-            self.n_bins = n_bins
         else:
             self.fc = nn.Linear(input_dim, n_bins)
             self.criterion = nn.MSELoss()
@@ -641,6 +669,10 @@ class model_cqt_pred(torch.nn.Module):
         # the truncation is calculated by bruteforce search since the nnAudio padding strategy and fairseq models are different
         # x = x[..., :-560]
         return torch.transpose(self.spec_layer(x), -1, -2)
+
+    def set_num_updates(self, num_updates: int):
+        if self.logistic:
+            self.target_scaler.set_num_updates(num_updates)
 
     def keep_dim_forward(self, x):
         # if the input is conv output: [batch, channel, len_seq]
@@ -662,12 +694,11 @@ class model_cqt_pred(torch.nn.Module):
         take input from transformer hidden states: [batch * len_seq, channel]
         output: [batch * len_seq, n_bins]
         """
+        batch_size = x.shape[0]
         x = self.fc(x)
-        x = x.unsqueeze(1)
+        x = x.view(batch_size, self.nr_mix, -1)
         x = self.conv(x)
         return x
-        # x = self.fc(x)
-        # return x.view(-1, 30, self.n_bins)
 
     def plain_forward(self, x):
         """
@@ -734,11 +765,18 @@ class MERTModel(BaseFairseqModel):
             )
         elif cfg.audio_extract_type == "spec_mlp":
             # This feature extractor converts inputs to mel-spectrograms and use mlp to match dimension.
-            self.scaler = get_scaler(init_min=-11, init_max=11)
+            # self.scaler = get_scaler(init_min=-11, init_max=11)
+            self.mel_scaler = get_scaler(
+                adaptive=True,
+                init_min=-12,
+                init_max=5,
+                warmup_updates=cfg.scaler_warmup_updates,
+                sync_stats=True,
+            )
             self.mel_extractor = nnAudioFeatures.mel.MelSpectrogram(
                 sr=task_cfg.sample_rate,
-                n_fft=2048,
-                hop_length=int(task_cfg.sample_rate // cfg.label_rate),
+                n_fft=1024,
+                hop_length=480,
                 fmin=32.7,
                 fmax=None,
                 n_mels=cfg.audio_mel_bins,
@@ -748,7 +786,7 @@ class MERTModel(BaseFairseqModel):
                 htk=True,
                 norm=True,
             )
-            self.patch_embed = PatchEmbed(None, patch_size=16, in_chans=1, embed_dim=cfg.encoder_embed_dim, dynamic_img_pad=True, flatten=True)
+            self.patch_embed = PatchEmbed(None, patch_size=cfg.patch_size, in_chans=1, embed_dim=cfg.encoder_embed_dim, dynamic_img_pad=True, flatten=True)
             # self.feature_extractor = nn.Conv2d(1, 1)
             self.feature_extractor = self.patchfy_extractor
         else:
@@ -809,7 +847,7 @@ class MERTModel(BaseFairseqModel):
 
 
         self.wav_normalize = cfg.wav_normalize
-        self.conv_pos = cfg.pos_type == "conv"
+        self.is_conv_pos = cfg.pos_type == "conv"
 
         if not self.learnable_temp:
             self.logit_temp = cfg.logit_temp
@@ -839,10 +877,10 @@ class MERTModel(BaseFairseqModel):
             if cfg.deepnorm:
                 assert not cfg.layer_norm_first
 
-            self.encoder = TransformerEncoder_extend(encoder_cfg, skip_pos_conv=not self.conv_pos)
+            self.encoder = TransformerEncoder_extend(encoder_cfg, skip_pos_conv=not self.is_conv_pos)
 
         else:
-            self.encoder = TransformerEncoder(encoder_cfg, skip_pos_conv=not self.conv_pos)
+            self.encoder = TransformerEncoder(encoder_cfg, skip_pos_conv=not self.is_conv_pos)
 
         if self.do_cnn_feat_stable_layernorm:
             self.layer_norm = LayerNorm(self.embed, elementwise_affine=False)
@@ -898,6 +936,7 @@ class MERTModel(BaseFairseqModel):
                 sr=int(task_cfg.sample_rate),
                 freq=int(cfg.label_rate),
                 logistic=cfg.logistic_cqt,
+                scaler_warmup_updates=cfg.scaler_warmup_updates,
             )
         if cfg.audio_mel_loss_m:
             logger.info(
@@ -970,6 +1009,10 @@ class MERTModel(BaseFairseqModel):
                 cfg.encoder_embed_dim, cfg.decoder_embed_dim, bias=True
             )
             if self.decoder_type == 'mae':
+                if cfg.decoder_causal:
+                    raise NotImplementedError(
+                        "decoder_causal is only implemented for decoder_type='wav2vec'."
+                    )
                 decoder_blocks = [
                     Block(
                         cfg.decoder_embed_dim, cfg.decoder_layers, 4.0, qkv_bias=True, norm_layer=LayerNorm
@@ -981,14 +1024,17 @@ class MERTModel(BaseFairseqModel):
                 decoder_cfg.encoder_layers = cfg.decoder_layers
                 decoder_cfg.encoder_embed_dim = cfg.decoder_embed_dim
                 decoder_cfg.encoder_ffn_embed_dim = cfg.decoder_ffn_embed_dim
-                self.decoder = TransformerEncoder(
-                    decoder_cfg
-                )
+                if cfg.decoder_causal:
+                    decoder_cfg.deepnorm = False
+                    decoder_cfg.subln = False
+                    decoder_cfg.attention_relax = 0.0
+                    self.decoder = TransformerEncoder_extend(
+                        decoder_cfg, causal=True
+                    )
+                else:
+                    self.decoder = TransformerEncoder(decoder_cfg)
             else:
                 raise NotImplementedError("Decoder not implemented yet!")
-            # self.decoder_layer_norm = LayerNorm(
-            #     cfg.encoder_embed_dim, elementwise_affine=False
-            # )
 
     def inbatch_noise_augment(
         self,
@@ -1291,7 +1337,7 @@ class MERTModel(BaseFairseqModel):
         mel_x = self.mel_extractor(x)
         mel_x = torch.clamp(mel_x, min=1e-5).log()
         mel_x = mel_x.unsqueeze(1).detach()
-        mel_x = self.scaler(mel_x)
+        mel_x = self.mel_scaler(mel_x)
         # B, L, D
         patches = self.patch_embed(mel_x)
         return patches.permute(0, 2, 1)  # B, D, L
@@ -1380,6 +1426,8 @@ class MERTModel(BaseFairseqModel):
                 )
 
         self.num_updates = num_updates
+        if self.cfg.audio_cqt_loss_m:
+            self.encoder_cqt_model.set_num_updates(num_updates)
 
     def forward(
         self,
@@ -1451,11 +1499,11 @@ class MERTModel(BaseFairseqModel):
 
         features = self.dropout_input(features)
         unmasked_features = self.dropout_features(unmasked_features)
-        if not self.conv_pos:
-            pos = torch.arange(features.size(1), device=features.device, dtype=features.dtype)
+        if not self.is_conv_pos:
+            pos = torch.arange(features.size(1), device=features.device, dtype=torch.float32)
             pos_emb = get_1d_sincos_pos_embed(
                 features.size(2), pos
-            )
+            ).to(features.dtype)
             features = features + pos_emb.unsqueeze(0)
 
 
@@ -1820,6 +1868,38 @@ class MERTModel(BaseFairseqModel):
 
 
 class TransformerEncoder_extend(TransformerEncoder):
+    def __init__(
+        self,
+        args: MERTConfig,
+        skip_pos_conv: bool = False,
+        causal: bool = False,
+    ):
+        if causal and args.layer_type != "transformer":
+            raise NotImplementedError(
+                "Causal attention is only implemented for transformer layers in TransformerEncoder_extend."
+            )
+        self.causal = causal
+        super().__init__(args, skip_pos_conv=skip_pos_conv)
+
+        if args.deepnorm:
+            # if is_encoder_decoder:
+            #     init_scale = (
+            #         math.pow(
+            #             math.pow(args.encoder_layers, 4) * args.decoder_layers, 0.0625
+            #         )
+            #         / 1.15
+            #     )
+            # else:
+            init_scale = math.pow(8.0 * args.encoder_layers, 0.25)
+            for name, p in self.named_parameters():
+                if (
+                    "fc1" in name
+                    or "fc2" in name
+                    or "out_proj" in name
+                    or "v_proj" in name
+                ):
+                    p.data.div_(init_scale)
+
     def build_encoder_layer(self, args: MERTConfig, **kwargs):
 
         if args.layer_type == "transformer":
@@ -1840,6 +1920,17 @@ class TransformerEncoder_extend(TransformerEncoder):
                     layer_norm_first=args.layer_norm_first,
                     residual_alpha=residual_alpha,
                     attention_relax=args.attention_relax,
+                )
+            elif self.causal:
+                layer = TransformerSentenceEncoderLayerCausal(
+                    embedding_dim=self.embedding_dim,
+                    ffn_embedding_dim=args.encoder_ffn_embed_dim,
+                    num_attention_heads=args.encoder_attention_heads,
+                    dropout=self.dropout,
+                    attention_dropout=args.attention_dropout,
+                    activation_dropout=args.activation_dropout,
+                    activation_fn=args.activation_fn,
+                    layer_norm_first=args.layer_norm_first,
                 )
             else:
                 layer = TransformerSentenceEncoderLayer(
@@ -1873,27 +1964,202 @@ class TransformerEncoder_extend(TransformerEncoder):
             layer = checkpoint_wrapper(layer)
         return layer
 
-    def __init__(self, args: MERTConfig, skip_pos_conv: bool = False):
-        super().__init__(args, skip_pos_conv=skip_pos_conv)
+    def forward(
+        self,
+        x,
+        padding_mask=None,
+        layer=None,
+        corpus_key=None,
+    ):
+        if not self.causal:
+            return super().forward(
+                x, padding_mask=padding_mask, layer=layer, corpus_key=corpus_key
+            )
 
-        if args.deepnorm:
-            # if is_encoder_decoder:
-            #     init_scale = (
-            #         math.pow(
-            #             math.pow(args.encoder_layers, 4) * args.decoder_layers, 0.0625
-            #         )
-            #         / 1.15
-            #     )
-            # else:
-            init_scale = math.pow(8.0 * args.encoder_layers, 0.25)
-            for name, p in self.named_parameters():
-                if (
-                    "fc1" in name
-                    or "fc2" in name
-                    or "out_proj" in name
-                    or "v_proj" in name
+        x, layer_results = self.extract_features(
+            x,
+            padding_mask=padding_mask,
+            tgt_layer=layer,
+            corpus_key=corpus_key,
+        )
+
+        if self.layer_norm_first and layer is None:
+            x = self.layer_norm(x)
+
+        return x, layer_results
+
+    def buffered_future_mask(self, tensor: torch.Tensor) -> torch.Tensor:
+        dim = tensor.size(0)
+        if (
+            not hasattr(self, "_future_mask")
+            or self._future_mask is None
+            or self._future_mask.device != tensor.device
+            or self._future_mask.size(0) < dim
+        ):
+            self._future_mask = torch.triu(
+                utils.fill_with_neg_inf(tensor.new(dim, dim)), 1
+            )
+        return self._future_mask[:dim, :dim]
+
+    def extract_features(
+        self,
+        x,
+        padding_mask=None,
+        tgt_layer=None,
+        min_layer=0,
+        corpus_key=None,
+    ):
+        if not self.causal:
+            return super().extract_features(
+                x,
+                padding_mask=padding_mask,
+                tgt_layer=tgt_layer,
+                min_layer=min_layer,
+                corpus_key=corpus_key,
+            )
+
+        if padding_mask is not None:
+            x = index_put(x, padding_mask, 0)
+
+        if self.pos_conv is not None:
+            x_conv = self.pos_conv(x.transpose(1, 2))
+            x_conv = x_conv.transpose(1, 2)
+            x = x + x_conv
+
+        if not self.layer_norm_first:
+            x = self.layer_norm(x)
+
+        x, pad_length = pad_to_multiple(
+            x, self.required_seq_len_multiple, dim=-2, value=0
+        )
+        if pad_length > 0 and padding_mask is None:
+            padding_mask = x.new_zeros((x.size(0), x.size(1)), dtype=torch.bool)
+            padding_mask[:, -pad_length:] = True
+        else:
+            padding_mask, _ = pad_to_multiple(
+                padding_mask, self.required_seq_len_multiple, dim=-1, value=True
+            )
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        x = x.transpose(0, 1)
+
+        self_attn_mask = self.buffered_future_mask(x) if self.causal else None
+
+        layer_results = []
+        r = None
+
+        for i, layer in enumerate(self.layers):
+            dropout_probability = np.random.random() if self.layerdrop > 0 else 1
+            if not self.training or (dropout_probability > self.layerdrop):
+                layer_check = layer
+                if isinstance(layer, FullyShardedDataParallel):
+                    layer_check = layer.unwrapped_module
+                if (corpus_key is None) or (
+                    not isinstance(
+                        layer_check, (TransformerSentenceEncoderWithAdapterLayer,)
+                    )
                 ):
-                    p.data.div_(init_scale)
+                    x, (z, lr) = layer(
+                        x,
+                        self_attn_mask=self_attn_mask,
+                        self_attn_padding_mask=padding_mask,
+                        need_weights=False,
+                    )
+                else:
+                    x, (z, lr) = layer(
+                        x,
+                        self_attn_mask=self_attn_mask,
+                        self_attn_padding_mask=padding_mask,
+                        need_weights=False,
+                        corpus_key=corpus_key,
+                    )
+                if i >= min_layer:
+                    layer_results.append((x, z, lr))
+            if i == tgt_layer:
+                r = x
+                break
+
+        if r is not None:
+            x = r
+
+        x = x.transpose(0, 1)
+
+        if pad_length > 0:
+            x = x[:, :-pad_length]
+
+            def undo_pad(a, b, c):
+                return (
+                    a[:-pad_length],
+                    b[:-pad_length] if b is not None else b,
+                    c[:-pad_length],
+                )
+
+            layer_results = [undo_pad(*u) for u in layer_results]
+
+        return x, layer_results
+
+
+class TransformerSentenceEncoderLayerCausal(TransformerSentenceEncoderLayer):
+    def forward(
+        self,
+        x: torch.Tensor,
+        self_attn_mask: torch.Tensor = None,
+        self_attn_padding_mask: torch.Tensor = None,
+        need_weights: bool = False,
+        att_args=None,
+    ):
+        residual = x
+
+        if self.layer_norm_first:
+            x = self.self_attn_layer_norm(x)
+            x, attn = self.self_attn(
+                query=x,
+                key=x,
+                value=x,
+                key_padding_mask=self_attn_padding_mask,
+                attn_mask=self_attn_mask,
+                need_weights=False,
+            )
+            x = self.dropout1(x)
+            x = residual + x
+
+            residual = x
+            x = self.final_layer_norm(x)
+            x = self.activation_fn(self.fc1(x))
+            x = self.dropout2(x)
+            x = self.fc2(x)
+
+            layer_result = x
+
+            x = self.dropout3(x)
+            x = residual + x
+        else:
+            x, attn = self.self_attn(
+                query=x,
+                key=x,
+                value=x,
+                key_padding_mask=self_attn_padding_mask,
+                attn_mask=self_attn_mask,
+                need_weights=need_weights,
+            )
+
+            x = self.dropout1(x)
+            x = residual + x
+
+            x = self.self_attn_layer_norm(x)
+
+            residual = x
+            x = self.activation_fn(self.fc1(x))
+            x = self.dropout2(x)
+            x = self.fc2(x)
+
+            layer_result = x
+
+            x = self.dropout3(x)
+            x = residual + x
+            x = self.final_layer_norm(x)
+
+        return x, (attn, layer_result)
 
 
 class TransformerSentenceEncoderLayerExtend(TransformerSentenceEncoderLayer):
