@@ -98,6 +98,9 @@ class MERTConfig(FairseqDataclass):
     decoder_ffn_embed_dim: int = field(
         default=1536, metadata={"help": "decoder embedding dimension for FFN"}
     )
+    decoder_attention_heads: int = field(
+        default=8, metadata={"help": "num decoder attention heads"}
+    )
     activation_fn: ChoiceEnum(utils.get_available_activation_fns()) = field(
         default="gelu", metadata={"help": "activation function to use"}
     )
@@ -110,6 +113,16 @@ class MERTConfig(FairseqDataclass):
     decoder_causal: bool = field(
         default=False,
         metadata={"help": "whether to use causal self-attention in the wav2vec decoder"},
+    )
+    decoder_self_attn_type: str = field(
+        default="standard",
+        metadata={"help": "decoder self attention type [standard/mwmha]"},
+    )
+    decoder_mwmha_window_sizes: List[int] = field(
+        default_factory=list,
+        metadata={
+            "help": "window sizes for decoder MW-MHA, e.g. [2, 5, 10, 25, 50, 125, 250, 250]"
+        },
     )
 
     # dropouts
@@ -1009,21 +1022,38 @@ class MERTModel(BaseFairseqModel):
                 cfg.encoder_embed_dim, cfg.decoder_embed_dim, bias=True
             )
             if self.decoder_type == 'mae':
-                if cfg.decoder_causal:
+                if cfg.decoder_causal or cfg.decoder_self_attn_type != "standard":
                     raise NotImplementedError(
-                        "decoder_causal is only implemented for decoder_type='wav2vec'."
+                        "other decoder types is only implemented for decoder_type='wav2vec'."
                     )
                 decoder_blocks = [
                     Block(
-                        cfg.decoder_embed_dim, cfg.decoder_layers, 4.0, qkv_bias=True, norm_layer=LayerNorm
+                        cfg.decoder_embed_dim,
+                        cfg.decoder_attention_heads,
+                        4.0,
+                        qkv_bias=True,
+                        norm_layer=LayerNorm,
                     )
-                for _ in range(8)] 
+                    for _ in range(cfg.decoder_layers)
+                ]
                 self.decoder = nn.Sequential(*decoder_blocks)
             elif self.decoder_type == 'wav2vec':
+                if cfg.decoder_self_attn_type not in {"standard", "mwmha"}:
+                    raise NotImplementedError(
+                        f"Unsupported decoder_self_attn_type={cfg.decoder_self_attn_type!r}. "
+                        "Supported values are 'standard' and 'mwmha'."
+                    )
+                if cfg.decoder_self_attn_type == "mwmha" and cfg.decoder_causal:
+                    raise NotImplementedError(
+                        "MW-MHA is only implemented for non-causal decoder self-attention."
+                    )
                 decoder_cfg = cfg.copy()
                 decoder_cfg.encoder_layers = cfg.decoder_layers
                 decoder_cfg.encoder_embed_dim = cfg.decoder_embed_dim
                 decoder_cfg.encoder_ffn_embed_dim = cfg.decoder_ffn_embed_dim
+                decoder_cfg.encoder_attention_heads = cfg.decoder_attention_heads
+                decoder_cfg.self_attn_type = cfg.decoder_self_attn_type
+                decoder_cfg.mwmha_window_sizes = cfg.decoder_mwmha_window_sizes
                 if cfg.decoder_causal:
                     decoder_cfg.deepnorm = False
                     decoder_cfg.subln = False
@@ -1031,6 +1061,8 @@ class MERTModel(BaseFairseqModel):
                     self.decoder = TransformerEncoder_extend(
                         decoder_cfg, causal=True
                     )
+                elif cfg.decoder_self_attn_type != "standard":
+                    self.decoder = TransformerEncoder_extend(decoder_cfg)
                 else:
                     self.decoder = TransformerEncoder(decoder_cfg)
             else:
@@ -1910,10 +1942,16 @@ class TransformerEncoder_extend(TransformerEncoder):
                     p.data.div_(init_scale)
 
     def build_encoder_layer(self, args: MERTConfig, **kwargs):
+        self_attn_type = getattr(args, "self_attn_type", "standard")
+        mwmha_window_sizes = getattr(args, "mwmha_window_sizes", None)
 
         if args.layer_type == "transformer":
-
-            if args.deepnorm or args.subln or args.attention_relax > 0.0:
+            if (
+                args.deepnorm
+                or args.subln
+                or args.attention_relax > 0.0
+                or self_attn_type != "standard"
+            ):
                 residual_alpha = 1.0
                 if args.deepnorm:
                     residual_alpha = math.pow(2.0 * args.encoder_layers, 0.25)
@@ -1929,6 +1967,8 @@ class TransformerEncoder_extend(TransformerEncoder):
                     layer_norm_first=args.layer_norm_first,
                     residual_alpha=residual_alpha,
                     attention_relax=args.attention_relax,
+                    self_attn_type=self_attn_type,
+                    mwmha_window_sizes=mwmha_window_sizes,
                 )
             elif self.causal:
                 layer = TransformerSentenceEncoderLayerCausal(
@@ -2189,6 +2229,8 @@ class TransformerSentenceEncoderLayerExtend(TransformerSentenceEncoderLayer):
         residual_alpha: float = 1.0,
         subln: bool = False,
         attention_relax: float = -1.0,
+        self_attn_type: str = "standard",
+        mwmha_window_sizes: Optional[List[int]] = None,
     ) -> None:
 
         super().__init__()
@@ -2203,8 +2245,16 @@ class TransformerSentenceEncoderLayerExtend(TransformerSentenceEncoderLayer):
         # Initialize blocks
         self.activation_fn = utils.get_activation_fn(activation_fn)
 
-        if attention_relax > 0:
-            # self.attention_relax = attention_relax
+        if self_attn_type == "mwmha":
+            if not mwmha_window_sizes:
+                raise ValueError("MW-MHA requires non-empty mwmha_window_sizes")
+            self.self_attn = MultiWindowMultiheadAttention(
+                self.embedding_dim,
+                num_attention_heads,
+                dropout=attention_dropout,
+                window_sizes=mwmha_window_sizes,
+            )
+        elif attention_relax > 0:
             logger.info(
                 f"creating custom attention layer with relaxation scale: {attention_relax}"
             )
@@ -2215,7 +2265,6 @@ class TransformerSentenceEncoderLayerExtend(TransformerSentenceEncoderLayer):
                 self_attention=True,
                 attention_relax=attention_relax,
             )
-
         else:
             self.self_attn = MultiheadAttention(
                 self.embedding_dim,
@@ -2706,5 +2755,212 @@ class MultiheadAttention_extend(MultiheadAttention):
             if not need_head_weights:
                 # average attention weights over heads
                 attn_weights = attn_weights.mean(dim=0)
+
+        return attn, attn_weights
+
+
+class MultiWindowMultiheadAttention(MultiheadAttention):
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        window_sizes: List[int],
+        kdim=None,
+        vdim=None,
+        dropout=0.0,
+        bias=True,
+        add_bias_kv=False,
+        add_zero_attn=False,
+        q_noise=0.0,
+        qn_block_size=8,
+        xformers_att_config: Optional[str] = None,
+        xformers_blocksparse_layout: Optional[torch.Tensor] = None,
+        xformers_blocksparse_blocksize: Optional[int] = 16,
+    ):
+        super().__init__(
+            embed_dim,
+            num_heads,
+            kdim=kdim,
+            vdim=vdim,
+            dropout=dropout,
+            bias=bias,
+            add_bias_kv=add_bias_kv,
+            add_zero_attn=add_zero_attn,
+            self_attention=True,
+            encoder_decoder_attention=False,
+            q_noise=q_noise,
+            qn_block_size=qn_block_size,
+            xformers_att_config=xformers_att_config,
+            xformers_blocksparse_layout=xformers_blocksparse_layout,
+            xformers_blocksparse_blocksize=xformers_blocksparse_blocksize,
+        )
+        self.window_sizes = tuple(window_sizes)
+
+    @staticmethod
+    def build_paper_window_sizes(num_patches: int, num_global_heads: int = 2) -> List[int]:
+        wins = [w for w in range(2, num_patches) if num_patches % w == 0]
+        wins.extend([num_patches] * num_global_heads)
+        return wins
+
+    def _resolve_window_sizes(self, seq_len: int) -> List[int]:
+        if len(self.window_sizes) == 1:
+            return [min(self.window_sizes[0], seq_len)] * self.num_heads
+
+        if len(self.window_sizes) != self.num_heads:
+            raise ValueError(
+                f"window_sizes must have length 1 or {self.num_heads}, "
+                f"got {len(self.window_sizes)}"
+            )
+
+        return [min(int(w), seq_len) for w in self.window_sizes]
+
+    def _windowed_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        window_size: int,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        bsz, seq_len, head_dim = q.shape
+
+        if key_padding_mask is None:
+            key_padding_mask = q.new_zeros((bsz, seq_len), dtype=torch.bool)
+
+        if window_size >= seq_len:
+            attn_weights = torch.matmul(q, k.transpose(-2, -1))
+            if attn_mask is not None:
+                attn_weights = attn_weights + attn_mask.unsqueeze(0).to(attn_weights.dtype)
+            attn_weights = attn_weights.masked_fill(
+                key_padding_mask.unsqueeze(1), float("-inf")
+            )
+            attn_weights = utils.softmax(attn_weights, dim=-1, onnx_trace=self.onnx_trace)
+            attn_probs = self.dropout_module(attn_weights)
+            attn = torch.matmul(attn_probs, v)
+            attn = attn.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
+            return attn, attn_weights if need_weights else None
+
+        pad_len = (window_size - seq_len % window_size) % window_size
+        if pad_len > 0:
+            q = F.pad(q, (0, 0, 0, pad_len))
+            k = F.pad(k, (0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, pad_len))
+            key_padding_mask = F.pad(key_padding_mask, (0, pad_len), value=True)
+            if attn_mask is not None:
+                attn_mask = F.pad(attn_mask, (0, pad_len, 0, pad_len), value=float("-inf"))
+
+        seq_len_pad = q.size(1)
+        num_windows = seq_len_pad // window_size
+
+        q = q.view(bsz, num_windows, window_size, head_dim)
+        k = k.view(bsz, num_windows, window_size, head_dim)
+        v = v.view(bsz, num_windows, window_size, head_dim)
+
+        attn_weights = torch.matmul(q, k.transpose(-2, -1))
+
+        if attn_mask is not None:
+            local_attn_mask = attn_mask.view(
+                num_windows, window_size, num_windows, window_size
+            )
+            index = torch.arange(num_windows, device=attn_weights.device)
+            local_attn_mask = local_attn_mask[index, :, index, :]
+            attn_weights = attn_weights + local_attn_mask.unsqueeze(0).to(attn_weights.dtype)
+
+        local_padding_mask = key_padding_mask.view(bsz, num_windows, window_size)
+        attn_weights = attn_weights.masked_fill(
+            local_padding_mask.unsqueeze(-2), float("-inf")
+        )
+        attn_weights = utils.softmax(attn_weights, dim=-1, onnx_trace=self.onnx_trace)
+        attn_probs = self.dropout_module(attn_weights)
+
+        attn = torch.matmul(attn_probs, v)
+        attn = attn.masked_fill(local_padding_mask.unsqueeze(-1), 0.0)
+        attn = attn.reshape(bsz, seq_len_pad, head_dim)[:, :seq_len]
+
+        if not need_weights:
+            return attn, None
+
+        dense_weights = attn_probs.new_zeros((bsz, seq_len_pad, seq_len_pad))
+        attn_probs = attn_probs.view(bsz, num_windows, window_size, window_size)
+        window_indices = torch.arange(seq_len_pad, device=attn_probs.device).view(
+            num_windows, window_size
+        )
+        dense_weights[
+            :,
+            window_indices[:, :, None],
+            window_indices[:, None, :],
+        ] = attn_probs
+
+        return attn, dense_weights[:, :seq_len, :seq_len]
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor],
+        value: Optional[torch.Tensor],
+        key_padding_mask: Optional[torch.Tensor] = None,
+        incremental_state: Optional[
+            Dict[str, Dict[str, Optional[torch.Tensor]]]
+        ] = None,
+        need_weights: bool = True,
+        static_kv: bool = False,
+        attn_mask: Optional[torch.Tensor] = None,
+        before_softmax: bool = False,
+        need_head_weights: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if before_softmax:
+            raise NotImplementedError("before_softmax is not supported for MW-MHA")
+        if incremental_state is not None or static_kv:
+            raise NotImplementedError("incremental decoding is not supported for MW-MHA")
+        if key is not None and key is not query:
+            raise NotImplementedError("MW-MHA only supports self-attention")
+        if value is not None and value is not query:
+            raise NotImplementedError("MW-MHA only supports self-attention")
+
+        if need_head_weights:
+            need_weights = True
+
+        tgt_len, bsz, embed_dim = query.size()
+        if not self.skip_embed_dim_check:
+            assert embed_dim == self.embed_dim, f"query dim {embed_dim} != {self.embed_dim}"
+
+        q = self.q_proj(query)
+        k = self.k_proj(query)
+        v = self.v_proj(query)
+        q *= self.scaling
+
+        q = q.contiguous().view(tgt_len, bsz, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
+        k = k.contiguous().view(tgt_len, bsz, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
+        v = v.contiguous().view(tgt_len, bsz, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
+
+        window_sizes = self._resolve_window_sizes(tgt_len)
+        head_outputs = []
+        head_weights = [] if need_weights else None
+
+        for head_idx, window_size in enumerate(window_sizes):
+            head_output, head_weight = self._windowed_attention(
+                q[:, head_idx],
+                k[:, head_idx],
+                v[:, head_idx],
+                window_size=window_size,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                need_weights=need_weights,
+            )
+            head_outputs.append(head_output.unsqueeze(1))
+            if need_weights:
+                head_weights.append(head_weight.unsqueeze(1))
+
+        attn = torch.cat(head_outputs, dim=1)
+        attn = attn.permute(2, 0, 1, 3).contiguous().view(tgt_len, bsz, self.embed_dim)
+        attn = self.out_proj(attn)
+
+        attn_weights = None
+        if need_weights:
+            attn_weights = torch.cat(head_weights, dim=1)
+            if not need_head_weights:
+                attn_weights = attn_weights.mean(dim=1)
 
         return attn, attn_weights
