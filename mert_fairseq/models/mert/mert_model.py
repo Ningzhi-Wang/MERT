@@ -1052,17 +1052,20 @@ class MERTModel(BaseFairseqModel):
                 decoder_cfg.encoder_embed_dim = cfg.decoder_embed_dim
                 decoder_cfg.encoder_ffn_embed_dim = cfg.decoder_ffn_embed_dim
                 decoder_cfg.encoder_attention_heads = cfg.decoder_attention_heads
-                decoder_cfg.self_attn_type = cfg.decoder_self_attn_type
-                decoder_cfg.mwmha_window_sizes = cfg.decoder_mwmha_window_sizes
                 if cfg.decoder_causal:
                     decoder_cfg.deepnorm = False
                     decoder_cfg.subln = False
                     decoder_cfg.attention_relax = 0.0
                     self.decoder = TransformerEncoder_extend(
-                        decoder_cfg, causal=True
+                        decoder_cfg,
+                        causal=True,
                     )
                 elif cfg.decoder_self_attn_type != "standard":
-                    self.decoder = TransformerEncoder_extend(decoder_cfg)
+                    self.decoder = TransformerEncoder_extend(
+                        decoder_cfg,
+                        self_attn_type=cfg.decoder_self_attn_type,
+                        mwmha_window_sizes=cfg.decoder_mwmha_window_sizes,
+                    )
                 else:
                     self.decoder = TransformerEncoder(decoder_cfg)
             else:
@@ -1914,12 +1917,16 @@ class TransformerEncoder_extend(TransformerEncoder):
         args: MERTConfig,
         skip_pos_conv: bool = False,
         causal: bool = False,
+        self_attn_type: str = "standard",
+        mwmha_window_sizes: Optional[List[int]] = None,
     ):
         if causal and args.layer_type != "transformer":
             raise NotImplementedError(
                 "Causal attention is only implemented for transformer layers in TransformerEncoder_extend."
             )
         self.causal = causal
+        self.self_attn_type = self_attn_type
+        self.mwmha_window_sizes = mwmha_window_sizes
         super().__init__(args, skip_pos_conv=skip_pos_conv)
 
         if args.deepnorm:
@@ -1942,15 +1949,13 @@ class TransformerEncoder_extend(TransformerEncoder):
                     p.data.div_(init_scale)
 
     def build_encoder_layer(self, args: MERTConfig, **kwargs):
-        self_attn_type = getattr(args, "self_attn_type", "standard")
-        mwmha_window_sizes = getattr(args, "mwmha_window_sizes", None)
 
         if args.layer_type == "transformer":
             if (
                 args.deepnorm
                 or args.subln
                 or args.attention_relax > 0.0
-                or self_attn_type != "standard"
+                or self.self_attn_type != "standard"
             ):
                 residual_alpha = 1.0
                 if args.deepnorm:
@@ -1967,8 +1972,8 @@ class TransformerEncoder_extend(TransformerEncoder):
                     layer_norm_first=args.layer_norm_first,
                     residual_alpha=residual_alpha,
                     attention_relax=args.attention_relax,
-                    self_attn_type=self_attn_type,
-                    mwmha_window_sizes=mwmha_window_sizes,
+                    self_attn_type=self.self_attn_type,
+                    mwmha_window_sizes=self.mwmha_window_sizes,
                 )
             elif self.causal:
                 layer = TransformerSentenceEncoderLayerCausal(
