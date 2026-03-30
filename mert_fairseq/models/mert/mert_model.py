@@ -2841,8 +2841,10 @@ class MultiWindowMultiheadAttention(MultiheadAttention):
             attn_weights = attn_weights.masked_fill(
                 key_padding_mask.unsqueeze(1), float("-inf")
             )
-            attn_weights = utils.softmax(attn_weights, dim=-1, onnx_trace=self.onnx_trace)
-            attn_probs = self.dropout_module(attn_weights)
+            attn_weights = utils.softmax(
+                attn_weights, dim=-1, onnx_trace=self.onnx_trace
+            )
+            attn_probs = self.dropout_module(attn_weights).type_as(v)
             attn = torch.matmul(attn_probs, v)
             attn = attn.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
             return attn, attn_weights if need_weights else None
@@ -2877,8 +2879,10 @@ class MultiWindowMultiheadAttention(MultiheadAttention):
         attn_weights = attn_weights.masked_fill(
             local_padding_mask.unsqueeze(-2), float("-inf")
         )
-        attn_weights = utils.softmax(attn_weights, dim=-1, onnx_trace=self.onnx_trace)
-        attn_probs = self.dropout_module(attn_weights)
+        attn_weights = utils.softmax(
+            attn_weights, dim=-1, onnx_trace=self.onnx_trace
+        )
+        attn_probs = self.dropout_module(attn_weights).type_as(v)
 
         attn = torch.matmul(attn_probs, v)
         attn = attn.masked_fill(local_padding_mask.unsqueeze(-1), 0.0)
@@ -2888,15 +2892,17 @@ class MultiWindowMultiheadAttention(MultiheadAttention):
             return attn, None
 
         dense_weights = attn_probs.new_zeros((bsz, seq_len_pad, seq_len_pad))
-        attn_probs = attn_probs.view(bsz, num_windows, window_size, window_size)
-        window_indices = torch.arange(seq_len_pad, device=attn_probs.device).view(
+        attn_weights = attn_weights.view(bsz, num_windows, window_size, window_size)
+        window_indices = torch.arange(
+            seq_len_pad, device=attn_weights.device
+        ).view(
             num_windows, window_size
         )
         dense_weights[
             :,
             window_indices[:, :, None],
             window_indices[:, None, :],
-        ] = attn_probs
+        ] = attn_weights
 
         return attn, dense_weights[:, :seq_len, :seq_len]
 
