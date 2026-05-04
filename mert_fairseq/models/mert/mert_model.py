@@ -411,7 +411,11 @@ class MERTConfig(FairseqDataclass):
         default=False,
         metadata={"help": "whether to predict the CQT of the audio of masked pard"},
     )
-    audio_mel_bins: int = field(
+    spec_type: str = field(
+        default="mel",
+        metadata={"help": "the type of spectrogram to use when audio_extract_type is spec_mlp"},
+    )
+    spec_num_bins: int = field(
         default=84,
         metadata={"help": "the bins of CQT feature"},
     )
@@ -779,26 +783,45 @@ class MERTModel(BaseFairseqModel):
         elif cfg.audio_extract_type == "spec_mlp":
             # This feature extractor converts inputs to mel-spectrograms and use mlp to match dimension.
             # self.scaler = get_scaler(init_min=-11, init_max=11)
-            self.mel_scaler = get_scaler(
+            self.spec_scaler = get_scaler(
                 adaptive=True,
                 init_min=-12,
                 init_max=5,
                 warmup_updates=cfg.scaler_warmup_updates,
                 sync_stats=True,
             )
-            self.mel_extractor = nnAudioFeatures.mel.MelSpectrogram(
-                sr=task_cfg.sample_rate,
-                n_fft=1024,
-                hop_length=480,
-                fmin=32.7,
-                fmax=None,
-                n_mels=cfg.audio_mel_bins,
-                window="hann",
-                center=True,
-                pad_mode="constant",
-                htk=True,
-                norm=True,
-            )
+            if cfg.spec_type == "mel":
+                self.spec_extractor = nnAudioFeatures.mel.MelSpectrogram(
+                    sr=task_cfg.sample_rate,
+                    n_fft=1024,
+                    hop_length=480,
+                    fmin=32.7,
+                    fmax=None,
+                    n_mels=cfg.spec_num_bins,
+                    window="hann",
+                    center=True,
+                    pad_mode="constant",
+                    htk=True,
+                    norm=True,
+                )
+            elif cfg.spec_type == 'cqt':
+                self.spec_extractor = nnAudioFeatures.cqt.CQT(
+                    sr=task_cfg.sample_rate,
+                    hop_length=480,
+                    fmin=32.7,
+                    fmax=None,
+                    n_bins=cfg.spec_num_bins,
+                    bins_per_octave=cfg.spec_num_bins // 7,
+                    filter_scale=1,
+                    norm=1,
+                    window="hann",
+                    center=True,
+                    pad_mode="constant",
+                    trainable=False,
+                    output_format="Magnitude",
+                    verbose=True,
+                )
+
             self.patch_embed = PatchEmbed(None, patch_size=cfg.patch_size, in_chans=1, embed_dim=cfg.encoder_embed_dim, dynamic_img_pad=True, flatten=True)
             # self.feature_extractor = nn.Conv2d(1, 1)
             self.feature_extractor = self.patchfy_extractor
@@ -957,7 +980,7 @@ class MERTModel(BaseFairseqModel):
             )
             self.encoder_mel_model = model_mel_pred(
                 input_dim=last_feature_dim,
-                n_bins=cfg.audio_mel_bins,
+                n_bins=cfg.spec_num_bins,
                 sr=int(task_cfg.sample_rate),
                 freq=int(cfg.label_rate),
             )
@@ -1369,12 +1392,12 @@ class MERTModel(BaseFairseqModel):
 
     def patchfy_extractor(self, x):
         # B, F, T
-        mel_x = self.mel_extractor(x)
-        mel_x = torch.clamp(mel_x, min=1e-5).log()
-        mel_x = mel_x.unsqueeze(1).detach()
-        mel_x = self.mel_scaler(mel_x)
+        spec_x = self.spec_extractor(x)
+        spec_x = torch.clamp(spec_x, min=1e-5).log()
+        spec_x = spec_x.unsqueeze(1).detach()
+        spec_x = self.spec_scaler(spec_x)
         # B, L, D
-        patches = self.patch_embed(mel_x)
+        patches = self.patch_embed(spec_x)
         return patches.permute(0, 2, 1)  # B, D, L
 
     def forward_features(self, source: torch.Tensor) -> torch.Tensor:
