@@ -1,5 +1,6 @@
 import argparse
 import os
+from typing import Optional
 import yaml
 import json
 import boto3
@@ -17,10 +18,14 @@ from fairseq import checkpoint_utils
 from musiceval.datasets import LatentModule
 from musiceval import tasks
 
+from pytorch_lightning.loggers import WandbLogger
+
+
 
 TASK_PATH = {
     "MTT": "c4dm-datasets/MagnaTagATune/",
     "GTZAN": "c4dm-datasets/gtzan/",
+    "GTZANBeatTracking": "c4dm-datasets/gtzan/",
     "EMO": "c4dm-datasets/emomuisc/",
     "Giantsteps": "c4dm-datasets/Giantsteps/",
     "NSynthPitch": "c4dm-datasets/NSynth/",
@@ -29,8 +34,21 @@ TASK_PATH = {
     "MTGGenre": "/data/scratch/acw713/datasets/mtg/",
     "MTGInstrument": "/data/scratch/acw713/datasets/mtg/",
     "PhonationModes": "/data/scratch/acw713/datasets/phonation_modes",
+    "VocalSetSinger": "c4dm-datasets/VocalSet/",
+    "VocalSetTechnique": "c4dm-datasets/VocalSet/",
+    "Harmonixset": "c4dm-datasets/Harmonixset/",
 }
 
+def get_logger(save_dir: str, run_name: Optional[str] = None) -> WandbLogger:
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+
+    return WandbLogger(
+        project="pretrain_MERT_RVQ-VAE_CQT",
+        name=run_name or save_path.name,
+        save_dir=str(save_path),
+        log_model=False,
+    )
 
 
 def evaluate(config, ckpt):
@@ -58,13 +76,17 @@ def evaluate(config, ckpt):
 
     # Perform hyperparameter search as in MERT
     lrs = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2]
+    # lrs = [5e-3]
     batch_size = [64]
     drop_outs = [0.2]
     l2s = [0]
+    layers = list(range(config['model']['input_channel']))
+    layers.append("all")
+    # layers = ["all"]
 
     train_sizes = [-1]
 
-    settings = list(product(lrs, batch_size, drop_outs, l2s))
+    settings = list(product(lrs, batch_size, drop_outs, l2s, layers))
     models, _, _ = checkpoint_utils.load_model_ensemble_and_task([ckpt])
     encoder = models[0]
     encoder.eval()
@@ -78,10 +100,11 @@ def evaluate(config, ckpt):
             results = {}
             task_config = config.copy()
             task = eval(f"tasks.{task_name}")(TASK_PATH[task_name], **task_config["task"])
-            data_param = task_config["data"]
             model_param = task_config["model"]
+            model_param["encoder"] = encoder
             trainer_param = task_config["trainer"]
             trainer_param["default_root_dir"] = root_path
+            data_param = task_config["data"]
             data_param["trainset_size"] = train_size
             data_param['encoder'] = encoder
             # datamodule = LatentModule(**data_param)
@@ -91,11 +114,12 @@ def evaluate(config, ckpt):
             for setting in settings:
                 print(f"evaluating {task_name} with setting: {setting}")
                 log_path = Path(root_path)
-                # wandb_logger = get_logger(log_path.stem, str(log_path / f"logs/{task}"))
+                wandb_logger = get_logger(str(log_path / f"logs/{task_name}"), f"{task_name}-probing")
                 model_param["lr"] = setting[0]
                 model_param["dropout"] = setting[2]
                 model_param["l2"] = setting[3]
-                model_param["feature_loaded"] = datamodule.feature_loaded
+                model_param["layer"] = setting[4]
+                model_param["feature_loaded"] = datamodule.train_feature_loaded
                 model = task.prober(**model_param)
                 early_stop = EarlyStopping(
                     monitor=f"{task_name}_val_loss",
@@ -116,7 +140,7 @@ def evaluate(config, ckpt):
                     checkpoint_callback,
                 ]
                 trainer_param["logger"] = False
-                # task_params["trainer"]["logger"] = wandb_logger
+                # trainer_param["logger"] = wandb_logger
                 trainer = pl.Trainer(**trainer_param)
                 trainer.fit(
                     model=model,
@@ -125,7 +149,9 @@ def evaluate(config, ckpt):
                 )
                 print(f"Loading best model from {checkpoint_callback.best_model_path}")
                 best_model = type(model).load_from_checkpoint(
-                    checkpoint_callback.best_model_path
+                    checkpoint_callback.best_model_path,
+                    feature_loaded=datamodule.test_feature_loaded,
+                    strict=False,
                 )
                 best_model.eval()
                 metric = trainer.test(
@@ -133,7 +159,7 @@ def evaluate(config, ckpt):
                     dataloaders=datamodule.test_dataloader(),
                 )[0]
                 results[
-                    f"lr:{setting[0]}-batch:{setting[1]}-drop:{setting[2]}-l2:{setting[3]}"
+                    f"lr:{setting[0]}-batch:{setting[1]}-drop:{setting[2]}-l2:{setting[3]}-layer:{setting[4]}"
                 ] = metric
 
             if os.getenv("DATASET_LOCATION", "LOCAL") == "S3":
@@ -164,7 +190,7 @@ def main():
     parser.add_argument("--ckpt", dest="ckpt", type=str, default=None)
     args = parser.parse_args()
     config_file = args.config
-    pl.seed_everything(1234)
+    pl.seed_everything(1234, workers=True)
     torch.manual_seed(1234)
     np.random.seed(1234)
     with open(config_file, "r") as f:
