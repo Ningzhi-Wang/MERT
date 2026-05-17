@@ -419,9 +419,17 @@ class MERTConfig(FairseqDataclass):
         default=84,
         metadata={"help": "the bins of CQT feature"},
     )
+    spec_hop_size: int = field(
+        default=-1,
+        metadata={"help": "the hop size for the spectrogram input when audio_extract_type is spec_mlp, -1 is to match the token rate."}
+    )
     patch_size: int = field(
         default=16,
         metadata={"help": "the patch size for the spectrogram input when audio_extract_type is spec_mlp"},
+    )
+    feature_type: str = field(
+        default='patch',
+        metadata={"help": "the type of features to extract when audio_extract_type is spec_mlp; patch or time_slice"}
     )
     # cqt extractor
     feature_extractor_cqt: bool = field(
@@ -790,11 +798,13 @@ class MERTModel(BaseFairseqModel):
                 warmup_updates=cfg.scaler_warmup_updates,
                 sync_stats=True,
             )
+            sample_rate = int(task_cfg.sample_rate)
+            token_rate = int(cfg.label_rate)
             if cfg.spec_type == "mel":
                 self.spec_extractor = nnAudioFeatures.mel.MelSpectrogram(
                     sr=task_cfg.sample_rate,
                     n_fft=1024,
-                    hop_length=480,
+                    hop_length=cfg.spec_hop_size if cfg.spec_hop_size > 0 else sample_rate // token_rate ,
                     fmin=32.7,
                     fmax=None,
                     n_mels=cfg.spec_num_bins,
@@ -807,7 +817,7 @@ class MERTModel(BaseFairseqModel):
             elif cfg.spec_type == 'cqt':
                 self.spec_extractor = nnAudioFeatures.cqt.CQT(
                     sr=task_cfg.sample_rate,
-                    hop_length=480,
+                    hop_length=cfg.spec_hop_size if cfg.spec_hop_size > 0 else sample_rate // token_rate ,
                     fmin=32.7,
                     fmax=None,
                     n_bins=cfg.spec_num_bins,
@@ -821,10 +831,13 @@ class MERTModel(BaseFairseqModel):
                     output_format="Magnitude",
                     verbose=True,
                 )
-
-            self.patch_embed = PatchEmbed(None, patch_size=cfg.patch_size, in_chans=1, embed_dim=cfg.encoder_embed_dim, dynamic_img_pad=True, flatten=True)
-            # self.feature_extractor = nn.Conv2d(1, 1)
-            self.feature_extractor = self.patchfy_extractor
+            if cfg.feature_type == 'patch':
+                self.patch_embed = PatchEmbed(None, patch_size=cfg.patch_size, in_chans=1, embed_dim=cfg.encoder_embed_dim, dynamic_img_pad=True, flatten=True)
+                # self.feature_extractor = nn.Conv2d(1, 1)
+                self.feature_extractor = self.patchfy_extractor
+            elif cfg.feature_type == 'time_slice':
+                self.time_slice_projector = nn.Linear(cfg.spec_num_bins, cfg.encoder_embed_dim)
+                self.feature_extractor = self.time_slice_extractor
         else:
             raise NotImplementedError(
                 "Only w2v_conv and spec_mlp are supported for now"
@@ -1399,6 +1412,15 @@ class MERTModel(BaseFairseqModel):
         # B, L, D
         patches = self.patch_embed(spec_x)
         return patches.permute(0, 2, 1)  # B, D, L
+
+    def time_slice_extractor(self, x):
+        # x: B, F, T
+        spec_x = self.spec_extractor(x)
+        spec_x = torch.clamp(spec_x, min=1e-5).log()
+        spec_x = spec_x.detach()
+        spec_x = self.spec_scaler(spec_x)
+        x = self.time_slice_projector(spec_x.permute(0, 2, 1))
+        return x.permute(0, 2, 1)  # B, D, T
 
     def forward_features(self, source: torch.Tensor) -> torch.Tensor:
         """
